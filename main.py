@@ -13,7 +13,14 @@ from datetime import datetime
 try:
     import yt_dlp
 except ImportError:
-    print("CRITICAL: 'yt_dlp' library missing.")
+    print("CRITICAL: 'yt_dlp' library missing. Please install: pip install yt-dlp")
+    sys.exit(1)
+
+try:
+    import mutagen
+except ImportError:
+    print("CRITICAL: 'mutagen' library missing. Required for metadata/cover art features.")
+    print("Please install: pip install mutagen")
     sys.exit(1)
 
 from PyQt6.QtWidgets import (
@@ -29,7 +36,7 @@ from PyQt6.QtGui import QIcon, QColor
 
 
 APP_NAME = "SoundStream Pro"
-VERSION = "1.7.1"
+VERSION = "3.8.0 (Metadata-Engine)"
 DEFAULT_DOWNLOAD_DIR = str(Path.home() / "Downloads")
 LOG_FILENAME = "app_debug.log"
 
@@ -221,9 +228,11 @@ class DownloadWorker(QThread):
             'progress_hooks': [self._progress_hook],
             'quiet': True,
             'no_warnings': True,
-            
             'writethumbnail': self.config.embed_metadata, 
             'addmetadata': self.config.embed_metadata,
+            'parse_metadata': [
+                '%(title)s:%(artist)s - %(title)s'
+            ],
             
             'postprocessors': [], 
             'postprocessor_args': {},
@@ -279,6 +288,12 @@ class DownloadWorker(QThread):
 
         if self.config.embed_metadata:
              opts['postprocessors'].append({'key': 'EmbedThumbnail'})
+             
+             opts['postprocessors'].append({
+                 'key': 'FFmpegMetadata',
+                 'add_chapters': True,
+                 'add_metadata': True
+             })
              
              opts['postprocessor_args']['FFmpegMetadata'] = [
                  '-metadata', f'comment=Downloaded via {APP_NAME}',
@@ -522,9 +537,7 @@ class MainWindow(QMainWindow):
             worker.signals.status_update.connect(self._on_status)
 
             self._add_table_row(url, config)
-            
             self.active_downloads[job_id] = worker
-            
             worker.start()
             self.url_input.clear()
             
@@ -551,7 +564,6 @@ class MainWindow(QMainWindow):
         btn_cancel = QPushButton("Cancel")
         btn_cancel.setObjectName("SecondaryBtn")
         btn_cancel.setStyleSheet("padding: 4px 12px;")
-        
         btn_cancel.clicked.connect(lambda: self._cancel_job(config.id))
         
         w_btn = QWidget()
@@ -568,7 +580,6 @@ class MainWindow(QMainWindow):
         self.table.setItem(row, 2, item_status)
         self.table.setCellWidget(row, 3, p_bar)
         self.table.setCellWidget(row, 4, w_btn)
-        
         self.table.scrollToBottom()
 
     def _get_row(self, job_id: str) -> int:
