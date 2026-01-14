@@ -29,7 +29,7 @@ from PyQt6.QtGui import QIcon, QColor
 
 
 APP_NAME = "SoundStream Pro"
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 DEFAULT_DOWNLOAD_DIR = str(Path.home() / "Downloads")
 LOG_FILENAME = "app_debug.log"
 
@@ -123,7 +123,7 @@ class DownloadJobConfig:
     quality: str
     normalize: bool
     embed_metadata: bool
-    filename_template: str--
+    filename_template: str
 
 class DownloadSignals(QObject):
     started = pyqtSignal(str)              # job_id
