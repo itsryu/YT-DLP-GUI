@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar,
     QMessageBox, QFrame, QScrollArea, QGroupBox, QFormLayout, 
     QCheckBox, QSpinBox, QPlainTextEdit,
-    QSplitter, QTabWidget, QRadioButton, QButtonGroup, QAbstractItemView
+    QSplitter, QTabWidget, QRadioButton, QButtonGroup, QAbstractItemView, QMenu
 )
 from PyQt6.QtCore import Qt, QObject, pyqtSignal, QThreadPool, pyqtSlot, QUrl
 from PyQt6.QtGui import QColor, QPixmap, QFont, QTextCursor, QTextCharFormat, QDesktopServices, QPalette, QAction, QCloseEvent
@@ -93,25 +93,10 @@ class ThemeManager:
         }
         QPushButton#Destructive:hover { background-color: rgba(211, 47, 47, 0.1); }
         
-        QLabel#MainHeader {
-            color: #007acc;
-            font-size: 24px;
-            font-weight: 800;
-            letter-spacing: 2px;
-        }
-        QLabel#ThumbLabel {
-            background-color: UID_THUMB_BG;
-            border: 1px solid UID_BORDER;
-            color: UID_THUMB_TEXT;
-        }
-        QLabel#StatsLabel, QLabel#LogHeader {
-            color: UID_THUMB_TEXT;
-        }
-        QLabel#LogHeader {
-            font-weight: bold;
-            font-size: 10px;
-            letter-spacing: 1px;
-        }
+        QLabel#MainHeader { color: #007acc; font-size: 24px; font-weight: 800; letter-spacing: 2px; }
+        QLabel#ThumbLabel { background-color: UID_THUMB_BG; border: 1px solid UID_BORDER; color: UID_THUMB_TEXT; }
+        QLabel#StatsLabel, QLabel#LogHeader { color: UID_THUMB_TEXT; }
+        QLabel#LogHeader { font-weight: bold; font-size: 10px; letter-spacing: 1px; }
         
         QPlainTextEdit#LogConsole {
             background-color: UID_CONSOLE_BG;
@@ -121,6 +106,11 @@ class ThemeManager:
             border: 1px solid UID_BORDER;
             border-radius: 4px;
         }
+        
+        QMenu { background-color: UID_PANEL_BG; border: 1px solid UID_BORDER; padding: 5px; }
+        QMenu::item { padding: 6px 20px 6px 20px; border-radius: 4px; }
+        QMenu::item:selected { background-color: #007acc; color: white; }
+        QMenu::separator { height: 1px; background: UID_BORDER; margin: 4px 10px; }
         """
         if is_dark:
             qss = qss.replace("UID_BORDER", "#3d3d3d")
@@ -565,9 +555,6 @@ class MainWindow(QMainWindow):
         btn_path = QPushButton("Change Folder")
         btn_path.clicked.connect(self.browse_folder)
         
-        btn_open_folder = QPushButton("Open Folder")
-        btn_open_folder.clicked.connect(self.open_output_folder)
-        
         self.btn_queue = QPushButton("Add to Queue")
         self.btn_queue.setObjectName("PrimaryAction")
         self.btn_queue.clicked.connect(self.queue_download)
@@ -575,7 +562,6 @@ class MainWindow(QMainWindow):
         action_layout.addWidget(QLabel("Output Folder:"))
         action_layout.addWidget(self.path_input)
         action_layout.addWidget(btn_path)
-        action_layout.addWidget(btn_open_folder)
         action_layout.addStretch()
         action_layout.addWidget(self.btn_queue)
         main_layout.addWidget(self.action_bar)
@@ -586,6 +572,10 @@ class MainWindow(QMainWindow):
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         header_view = self.table.horizontalHeader()
         header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._show_context_menu)
+        
         main_layout.addWidget(self.table)
         
         self.log_viewer = LogViewerWidget()
@@ -600,6 +590,50 @@ class MainWindow(QMainWindow):
         final_layout = QVBoxLayout(central)
         final_layout.setContentsMargins(0,0,0,0)
         final_layout.addWidget(main_splitter)
+
+    def _show_context_menu(self, pos):
+        item = self.table.itemAt(pos)
+        menu = QMenu(self)
+        
+        if item:
+            row = item.row()
+            job_id = self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+            
+            action_remove = QAction("Remove from Queue", self)
+            action_remove.triggered.connect(lambda: self._remove_from_queue(job_id))
+            menu.addAction(action_remove)
+            
+            if job_id in self.active_runnables:
+                action_cancel = QAction("Cancel Download (Instant)", self)
+                action_cancel.triggered.connect(lambda: self.cancel_job(job_id))
+                menu.addAction(action_cancel)
+                
+            menu.addSeparator()
+            
+        action_open = QAction("Open Output Folder", self)
+        action_open.triggered.connect(self.open_output_folder)
+        menu.addAction(action_open)
+        
+        action_clear = QAction("Clear All Completed", self)
+        action_clear.triggered.connect(self._clear_finished_jobs)
+        menu.addAction(action_clear)
+        
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _remove_from_queue(self, job_id: str):
+        if job_id in self.active_runnables:
+            self.active_runnables[job_id].cancel()
+            del self.active_runnables[job_id]
+            
+        row = self.get_row_by_id(job_id)
+        if row >= 0:
+            self.table.removeRow(row)
+
+    def _clear_finished_jobs(self):
+        for row in range(self.table.rowCount() - 1, -1, -1):
+            status_item = self.table.item(row, 2)
+            if status_item and status_item.text() in ["✔ Done", "✘ Error", "Cancelled"]:
+                self.table.removeRow(row)
 
     def toggle_dev_mode(self, checked: bool):
         logging.getLogger().setLevel(logging.DEBUG if checked else logging.INFO)
@@ -761,7 +795,7 @@ class MainWindow(QMainWindow):
     def cancel_job(self, job_id: str):
         if job_id in self.active_runnables:
             self.active_runnables[job_id].cancel()
-            self.update_status(job_id, "Stopping...")
+            self._cleanup_job(job_id, "Cancelled", QColor("#ff9800"))
 
     def _cleanup_job(self, job_id: str, status_text: str, color: QColor):
         row = self.get_row_by_id(job_id)
@@ -769,24 +803,30 @@ class MainWindow(QMainWindow):
             item = self.table.item(row, 2)
             item.setText(status_text)
             item.setForeground(color)
+            
             if "Done" in status_text: 
                 self.table.cellWidget(row, 3).setValue(100)
+                btn_open = QPushButton("Open Folder")
+                btn_open.clicked.connect(self.open_output_folder)
                 
-            btn_open = QPushButton("Open File")
-            btn_open.clicked.connect(self.open_output_folder)
-            
-            layout = QHBoxLayout()
-            layout.setContentsMargins(0, 0, 0, 0)
-            layout.addWidget(btn_open)
-            container = QWidget()
-            container.setLayout(layout)
-            
-            self.table.setCellWidget(row, 4, container)
-            
-        if job_id in self.active_runnables: del self.active_runnables[job_id]
+                layout = QHBoxLayout()
+                layout.setContentsMargins(0, 0, 0, 0)
+                layout.addWidget(btn_open)
+                container = QWidget()
+                container.setLayout(layout)
+                self.table.setCellWidget(row, 4, container)
+                
+            elif "Cancelled" in status_text:
+                self.table.cellWidget(row, 3).setValue(0)
+                self.table.setCellWidget(row, 4, None)
+                
+            elif "Error" in status_text:
+                self.table.setCellWidget(row, 4, None)
+                
+        if job_id in self.active_runnables: 
+            del self.active_runnables[job_id]
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        """Impede crash (RuntimeError) derivado do ciclo de vida C++/Python."""
         root_logger = logging.getLogger()
         if self.qt_log_handler in root_logger.handlers:
             root_logger.removeHandler(self.qt_log_handler)

@@ -69,6 +69,37 @@ class WorkerSignals(QObject):
     status = pyqtSignal(str, str)
     thumbnail_data = pyqtSignal(bytes)
 
+class YtDlpInterceptorLogger:
+    """
+    Proxy Logger para interceptar o fluxo interno do yt-dlp.
+    Permite o cancelamento imediato injetando uma exceção na thread assim que
+    o yt-dlp tentar realizar qualquer log (ex: avisos de retry pós timeout).
+    """
+    def __init__(self, runnable):
+        self.runnable = runnable
+        self.logger = logging.getLogger(f"yt_dlp_{runnable.config.job_id[:8]}")
+
+    def _check_abort(self):
+        if self.runnable._is_cancelled:
+            raise DownloadError("Operação cancelada pelo usuário")
+
+    def debug(self, msg):
+        self._check_abort()
+        self.logger.debug(msg)
+
+    def info(self, msg):
+        self._check_abort()
+        self.logger.info(msg)
+
+    def warning(self, msg):
+        self._check_abort()
+        self.logger.warning(msg)
+
+    def error(self, msg):
+        self._check_abort()
+        self.logger.error(msg)
+
+
 class YtDlpService:
     URL_REGEX = re.compile(
         r'^(https?://)?(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com|vimeo\.com|soundcloud\.com)/.+$'
@@ -85,6 +116,7 @@ class YtDlpService:
             'quiet': True,
             'no_warnings': True,
             'extract_flat': False,
+            'socket_timeout': 10,
             'logger': logging.getLogger('yt_dlp_internal'),
             'extractor_args': {'youtube': {'player_client': ['android', 'web']}}
         }
@@ -205,11 +237,11 @@ class DownloadRunnable(QRunnable):
             'ignoreerrors': True,
             'retries': 10,
             'fragment_retries': 10,
-            'socket_timeout': 30,
+            'socket_timeout': 10,
             'writethumbnail': self.config.embed_thumbnail,
             'addmetadata': self.config.embed_metadata,
             'writesubtitles': self.config.embed_subs,
-            'logger': logging.getLogger(f"yt_dlp_{self.config.job_id[:8]}"),
+            'logger': YtDlpInterceptorLogger(self),
             'postprocessors': [],
             'postprocessor_args': {},
             'extractor_args': {
@@ -288,14 +320,17 @@ class DownloadRunnable(QRunnable):
                 self.signals.status.emit(self.config.job_id, "Downloading...")
                 ydl.download([self.config.url])
             
-            if self._is_cancelled: raise DownloadError("Cancelled")
+            if self._is_cancelled: 
+                raise DownloadError("Cancelled")
+            
             self._finalize_move()
             self.signals.status.emit(self.config.job_id, "Complete")
             self.signals.finished.emit()
+            
         except Exception as e:
             shutil.rmtree(self._temp_dir, ignore_errors=True)
             if self._is_cancelled:
-                self.signals.status.emit(self.config.job_id, "Cancelled")
+                pass
             else:
                 self._logger.error(f"Failed: {e}", exc_info=True)
                 self.signals.error.emit(str(e))
