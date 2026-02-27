@@ -3,7 +3,14 @@ import logging
 import uuid
 import re
 import types
-from typing import Final, Dict, Any, Optional, cast
+import json
+import urllib.parse
+import urllib.request
+import urllib.error
+import time
+import ssl
+from dataclasses import dataclass
+from typing import Final, Dict, Any, Optional, List
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
@@ -165,6 +172,211 @@ class LogViewerWidget(QWidget):
     def clear_logs(self) -> None:
         self.text_edit.clear()
 
+@dataclass
+class MetadataCandidate:
+    title: str
+    artist: str
+    album: str
+    date: str
+    genre: str
+    release_id: str  # MBID necessário para o Cover Art Archive
+
+class MusicBrainzSignals(QObject):
+    results_ready = pyqtSignal(list)
+    error = pyqtSignal(str)
+
+class CoverArtSignals(QObject):
+    result_ready = pyqtSignal(QImage)
+    error = pyqtSignal(str)
+
+class MusicBrainzWorker(QRunnable):
+    def __init__(self, title_query: str, artist_query: str, album_query: str, date_query: str, app_name: str, version: str) -> None:
+        super().__init__()
+        self.title_query = title_query
+        self.artist_query = artist_query
+        self.album_query = album_query
+        self.date_query = date_query
+        self.app_name = app_name
+        self.version = version
+        self.signals = MusicBrainzSignals()
+
+    def _escape_lucene(self, text: str) -> str:
+        """Limpa a string para compatibilidade com a sintaxe de pesquisa Lucene."""
+        return re.sub(r'([+\-!(){}\[\]^"~*?:\\])', r'\\\1', text)
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            query_parts = []
+            if self.title_query:
+                query_parts.append(f'recording:"{self._escape_lucene(self.title_query)}"')
+            if self.artist_query:
+                query_parts.append(f'artist:"{self._escape_lucene(self.artist_query)}"')
+            if self.album_query:
+                query_parts.append(f'release:"{self._escape_lucene(self.album_query)}"')
+            if self.date_query:
+                # O MusicBrainz aceita anos (YYYY) no campo date da entidade recording
+                query_parts.append(f'date:"{self._escape_lucene(self.date_query)}"')
+            
+            if not query_parts:
+                self.signals.results_ready.emit([])
+                return
+
+            query = " AND ".join(query_parts)
+            encoded_query = urllib.parse.quote(query)
+            
+            url = f"https://musicbrainz.org/ws/2/recording/?query={encoded_query}&fmt=json"
+            
+            headers = {
+                "User-Agent": f"{self.app_name}/{self.version} ( dev@localhost )",
+                "Accept": "application/json",
+                "Connection": "close"
+            }
+            req = urllib.request.Request(url, headers=headers)
+            ctx = ssl.create_default_context()
+            
+            max_retries = 3
+            data = None
+            
+            for attempt in range(max_retries):
+                try:
+                    with urllib.request.urlopen(req, timeout=15, context=ctx) as response:
+                        data = json.loads(response.read().decode('utf-8'))
+                    break
+                except (urllib.error.URLError, ssl.SSLError, ConnectionError) as e:
+                    if attempt == max_retries - 1:
+                        raise e
+                    time.sleep(2 ** attempt)
+            
+            if not data:
+                self.signals.results_ready.emit([])
+                return
+                
+            candidates: List[MetadataCandidate] = []
+            for rec in data.get("recordings", [])[:15]: 
+                title = rec.get("title", "")
+                
+                artist_credits = rec.get("artist-credit", [])
+                artist = "".join([ac.get("name", "") + ac.get("joinphrase", "") for ac in artist_credits])
+                
+                releases = rec.get("releases", [])
+                album = releases[0].get("title", "") if releases else ""
+                date = releases[0].get("date", "")[:4] if releases and releases[0].get("date") else ""
+                
+                # Resolução do identificador universal (MBID) para interoperabilidade com CAA
+                release_id = releases[0].get("id", "") if releases else ""
+                
+                tags = rec.get("tags", [])
+                genre = tags[0].get("name", "").title() if tags else ""
+                
+                candidates.append(MetadataCandidate(title, artist, album, date, genre, release_id))
+                
+            self.signals.results_ready.emit(candidates)
+            
+        except Exception as e:
+            self.signals.error.emit(str(e))
+
+class CoverArtWorker(QRunnable):
+    """
+    Worker especializado na obtenção de arte de capa na resolução original.
+    Implementa resiliência TLS via Connection:close e retentativas com Exponential Backoff.
+    """
+    def __init__(self, release_id: str) -> None:
+        super().__init__()
+        self.release_id = release_id
+        self.signals = CoverArtSignals()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        if not self.release_id:
+            self.signals.error.emit("Sem MBID de Release.")
+            return
+
+        # O endpoint /front redireciona para a imagem original (máxima qualidade)
+        url = f"https://coverartarchive.org/release/{self.release_id}/front"
+        headers = {
+            "User-Agent": f"{APP_NAME}/{VERSION} ( dev@localhost )",
+            "Accept": "image/*",
+            "Connection": "close"
+        }
+        req = urllib.request.Request(url, headers=headers)
+        ctx = ssl.create_default_context()
+        
+        max_retries = 3
+        buffer = None
+
+        for attempt in range(max_retries):
+            try:
+                with urllib.request.urlopen(req, timeout=25, context=ctx) as response:
+                    buffer = response.read()
+                break
+            except (urllib.error.URLError, ssl.SSLError, ConnectionError) as e:
+                if attempt == max_retries - 1:
+                    self.signals.error.emit(f"Falha persistente na camada SSL/TLS: {str(e)}")
+                    return
+                # Recuo exponencial para mitigar rate-limiting ou instabilidade de handshake
+                time.sleep(2 ** attempt)
+
+        if not buffer:
+            return
+
+        try:
+            image = QImage()
+            if image.loadFromData(buffer):
+                self.signals.result_ready.emit(image)
+            else:
+                self.signals.error.emit("A descodificação do fluxo binário da imagem falhou.")
+        except Exception as e:
+            self.signals.error.emit(f"Erro de processamento de imagem: {str(e)}")
+
+class MetadataSelectionDialog(QDialog):
+    def __init__(self, candidates: List[MetadataCandidate], parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("MusicBrainz: Selecionar Metadados")
+        self.setMinimumSize(700, 400)
+        self.selected_candidate: Optional[MetadataCandidate] = None
+        self.candidates = candidates
+        self._init_ui()
+
+    def _init_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        
+        self.table = QTableWidget(self)
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(["Título", "Artista", "Álbum", "Ano", "Género"])
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        
+        header = self.table.horizontalHeader()
+        if header is not None:
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        
+        self._populate_table()
+        layout.addWidget(self.table)
+        
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self)
+        btn_box.accepted.connect(self._on_accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
+
+    def _populate_table(self) -> None:
+        self.table.setRowCount(len(self.candidates))
+        for row, cand in enumerate(self.candidates):
+            self.table.setItem(row, 0, QTableWidgetItem(cand.title))
+            self.table.setItem(row, 1, QTableWidgetItem(cand.artist))
+            self.table.setItem(row, 2, QTableWidgetItem(cand.album))
+            self.table.setItem(row, 3, QTableWidgetItem(cand.date))
+            self.table.setItem(row, 4, QTableWidgetItem(cand.genre))
+
+    def _on_accept(self) -> None:
+        selected_items = self.table.selectedItems()
+        if selected_items:
+            row = selected_items[0].row()
+            self.selected_candidate = self.candidates[row]
+        self.accept()
+
 class InspectorPanel(QFrame):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -279,49 +491,54 @@ class InspectorPanel(QFrame):
         fmt_layout.addLayout(fmt_grid)
         fmt_layout.addStretch()
         
-        tab_meta = QWidget()
-        meta_scroll = QScrollArea()
+        # --- TAB METADATA ---
+        tab_meta = QWidget(self.tabs)
+        meta_scroll = QScrollArea(tab_meta)
         meta_scroll.setWidgetResizable(True)
         meta_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        meta_content = QWidget()
+        meta_content = QWidget(meta_scroll)
         meta_form = QFormLayout(meta_content)
         
-        self.in_filename = QLineEdit()
-        self.in_filename.setPlaceholderText("Output filename (without extension)")
-        self.in_title = QLineEdit()
-        self.in_artist = QLineEdit()
-        self.in_album = QLineEdit()
-        self.in_genre = QLineEdit()
-        self.in_date = QLineEdit()
-        self.in_desc = QPlainTextEdit()
+        self.btn_fetch_mb = QPushButton("Preenchimento Automático (MusicBrainz)", meta_content)
+        self.btn_fetch_mb.setObjectName("PrimaryAction")
+        self.btn_fetch_mb.clicked.connect(self._trigger_musicbrainz_fetch)
+        
+        self.in_filename = QLineEdit(meta_content)
+        self.in_title = QLineEdit(meta_content)
+        self.in_artist = QLineEdit(meta_content)
+        self.in_album = QLineEdit(meta_content)
+        self.in_genre = QLineEdit(meta_content)
+        self.in_date = QLineEdit(meta_content)
+        self.in_desc = QPlainTextEdit(meta_content)
         self.in_desc.setFixedHeight(60)
         
-        meta_form.addRow("Filename:", self.in_filename)
-        meta_form.addRow("Title:", self.in_title)
-        meta_form.addRow("Artist:", self.in_artist)
-        meta_form.addRow("Album:", self.in_album)
-        meta_form.addRow("Genre:", self.in_genre)
-        meta_form.addRow("Date (YYYY):", self.in_date)
-        meta_form.addRow("Description:", self.in_desc)
+        meta_form.addRow("", self.btn_fetch_mb)
+        meta_form.addRow("Nome do Ficheiro:", self.in_filename)
+        meta_form.addRow("Título:", self.in_title)
+        meta_form.addRow("Artista:", self.in_artist)
+        meta_form.addRow("Álbum:", self.in_album)
+        meta_form.addRow("Género:", self.in_genre)
+        meta_form.addRow("Data (AAAA):", self.in_date)
+        meta_form.addRow("Descrição:", self.in_desc)
         
         meta_scroll.setWidget(meta_content)
         meta_layout = QVBoxLayout(tab_meta)
         meta_layout.addWidget(meta_scroll)
 
-        tab_adv = QWidget()
+        # --- TAB AVANÇADA ---
+        tab_adv = QWidget(self.tabs)
         adv_layout = QVBoxLayout(tab_adv)
         
-        chk_group = QGroupBox("Standard Options")
+        chk_group = QGroupBox("Opções Standard", tab_adv)
         chk_layout = QVBoxLayout(chk_group)
-        self.chk_meta = QCheckBox("Embed Metadata")
-        self.chk_thumb = QCheckBox("Embed Thumbnail")
-        self.chk_subs = QCheckBox("Download Subtitles")
-        self.chk_norm = QCheckBox("Audio Normalization")
-        self.chk_cookies = QCheckBox("Use Browser Cookies")
+        self.chk_meta = QCheckBox("Embutir Metadados", chk_group)
+        self.chk_thumb = QCheckBox("Embutir Miniatura", chk_group)
+        self.chk_subs = QCheckBox("Transferir Legendas", chk_group)
+        self.chk_norm = QCheckBox("Normalização de Áudio", chk_group)
+        self.chk_cookies = QCheckBox("Utilizar Cookies do Navegador", chk_group)
         
         self.chk_meta.setChecked(True)
         self.chk_thumb.setChecked(True)
-        self.chk_cookies.setToolTip("Attempts to extract cookies from Chrome to bypass 403 Forbidden errors.")
         
         chk_layout.addWidget(self.chk_meta)
         chk_layout.addWidget(self.chk_thumb)
@@ -381,34 +598,100 @@ class InspectorPanel(QFrame):
         
         self._update_ui_mode()
 
+    def _trigger_musicbrainz_fetch(self) -> None:
+        title = self.in_title.text().strip()
+        artist = self.in_artist.text().strip()
+        album = self.in_album.text().strip()
+        date = self.in_date.text().strip()
+        
+        if not title and not artist and not album:
+            QMessageBox.information(self, "Aviso", "Preencha ao menos o 'Título', 'Artista' ou 'Álbum' como base de pesquisa.")
+            return
+
+        self.btn_fetch_mb.setEnabled(False)
+        self.btn_fetch_mb.setText("A procurar...")
+        
+        worker = MusicBrainzWorker(title, artist, album, date, APP_NAME, VERSION)
+        worker.signals.results_ready.connect(self._on_musicbrainz_results)
+        worker.signals.error.connect(self._on_musicbrainz_error)
+        
+        QThreadPool.globalInstance().start(worker)
+
+    @pyqtSlot(list)
+    def _on_musicbrainz_results(self, candidates: List[MetadataCandidate]) -> None:
+        if sip.isdeleted(self) or sip.isdeleted(self.btn_fetch_mb): return
+        self.btn_fetch_mb.setEnabled(True)
+        self.btn_fetch_mb.setText("Preenchimento Automático (MusicBrainz)")
+        
+        if not candidates:
+            QMessageBox.information(self, "MusicBrainz", "Nenhum resultado encontrado.")
+            return
+            
+        dialog = MetadataSelectionDialog(candidates, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selected_candidate:
+            cand = dialog.selected_candidate
+            if cand.title and not sip.isdeleted(self.in_title): self.in_title.setText(cand.title)
+            if cand.artist and not sip.isdeleted(self.in_artist): self.in_artist.setText(cand.artist)
+            if cand.album and not sip.isdeleted(self.in_album): self.in_album.setText(cand.album)
+            if cand.date and not sip.isdeleted(self.in_date): self.in_date.setText(cand.date)
+            if cand.genre and not sip.isdeleted(self.in_genre): self.in_genre.setText(cand.genre)
+            
+            # Transferência da arte original com lógica de resiliência SSL
+            if cand.release_id:
+                self.btn_fetch_mb.setText("A transferir arte HD...")
+                self.btn_fetch_mb.setEnabled(False)
+                
+                ca_worker = CoverArtWorker(cand.release_id)
+                ca_worker.signals.result_ready.connect(self._on_cover_art_ready)
+                ca_worker.signals.error.connect(self._on_cover_art_error)
+                QThreadPool.globalInstance().start(ca_worker)
+
+    @pyqtSlot(QImage)
+    def _on_cover_art_ready(self, image: QImage) -> None:
+        if sip.isdeleted(self) or sip.isdeleted(self.btn_fetch_mb): return
+        self.btn_fetch_mb.setEnabled(True)
+        self.btn_fetch_mb.setText("Preenchimento Automático (MusicBrainz)")
+        
+        pixmap = QPixmap.fromImage(image)
+        self.set_thumbnail(pixmap)
+        logging.info("Arte de alta resolução aplicada via Cover Art Archive.")
+
+    @pyqtSlot(str)
+    def _on_cover_art_error(self, err_msg: str) -> None:
+        """
+        Garante que, em caso de erro na obtenção da arte HD, a miniatura 
+        original do vídeo seja preservada sem alterações.
+        """
+        if sip.isdeleted(self) or sip.isdeleted(self.btn_fetch_mb): return
+        self.btn_fetch_mb.setEnabled(True)
+        self.btn_fetch_mb.setText("Preenchimento Automático (MusicBrainz)")
+        logging.warning(f"Resolução da Arte ignorada (Original preservada): {err_msg}")
+
+    @pyqtSlot(str)
+    def _on_musicbrainz_error(self, err_msg: str) -> None:
+        if sip.isdeleted(self) or sip.isdeleted(self.btn_fetch_mb): return
+        self.btn_fetch_mb.setEnabled(True)
+        self.btn_fetch_mb.setText("Preenchimento Automático (MusicBrainz)")
+        QMessageBox.warning(self, "Erro MusicBrainz", f"Falha na API:\n{err_msg}")
+
     def _show_template_tutorial(self) -> None:
-        """Exibe diretrizes acadêmicas sobre injeção de templates estruturados no wrapper."""
         tutorial_html = (
-            "<h3>Guia Acadêmico de Nomenclatura Dinâmica (Output Template)</h3>"
-            "<p>O template de saída orquestra a montagem estruturada dos diretórios e arquivos "
-            "com base em metadados injetados durante a fase de extração.</p>"
+            "<h3>Guia de Nomenclatura Dinâmica (Output Template)</h3>"
+            "<p>O template de saída orquestra a montagem estruturada dos diretórios e ficheiros.</p>"
             "<br>"
-            "<b>Variáveis de Contexto (Chaves de Dicionário):</b>"
+            "<b>Variáveis de Contexto Disponíveis:</b>"
             "<ul>"
-            "<li><code>%(title)s</code>: Título literal da faixa ou vídeo</li>"
-            "<li><code>%(ext)s</code>: Extensão codificada (ex: flac, mp3, mp4)</li>"
+            "<li><code>%(title)s</code>: Título literal da faixa</li>"
+            "<li><code>%(artist)s</code>: Nome do Artista</li>"
+            "<li><code>%(album)s</code>: Nome do Álbum</li>"
+            "<li><code>%(genre)s</code>: Género Musical</li>"
+            "<li><code>%(release_year)s</code>: Ano de Lançamento (YYYY)</li>"
+            "<li><code>%(ext)s</code>: Extensão do ficheiro (ex: mp3, flac)</li>"
             "<li><code>%(uploader)s</code>: Entidade ou canal remetente</li>"
             "<li><code>%(upload_date)s</code>: Data de transmissão original (YYYYMMDD)</li>"
-            "<li><code>%(playlist)s</code>: Nome do array contêiner (Playlist/Álbum)</li>"
+            "<li><code>%(playlist)s</code>: Nome da Playlist/Álbum de origem</li>"
             "<li><code>%(playlist_index)s</code>: Índice sequencial (Track Number)</li>"
             "</ul>"
-            "<br>"
-            "<b>Arquiteturas Recomendadas (Exemplos):</b>"
-            "<ul>"
-            "<li><b>Padrão Limpo:</b><br><code>%(title)s.%(ext)s</code></li>"
-            "<li><b>Identidade Única (Safe Hash):</b><br><code>%(title)s [%(id)s].%(ext)s</code></li>"
-            "<li><b>Construção de Árvore de Diretórios (Álbum):</b><br><code>%(uploader)s/%(playlist)s/%(playlist_index)s - %(title)s.%(ext)s</code></li>"
-            "</ul>"
-            "<br>"
-            "<p><i>Nota de Engenharia (Bypass HTTP 403):</i> Devido a recentes restrições arquiteturais "
-            "do YouTube em requisições de clientes emulados (Android), certas coletas de áudio necessitam "
-            "de um GVS PO Token. Insira no campo <b>Custom Flags</b> o argumento:</p>"
-            "<code>--extractor-args \"youtube:po_token=android.gvs+SEU_TOKEN\"</code>"
         )
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle("Tutorial: yt-dlp Output Templates")
