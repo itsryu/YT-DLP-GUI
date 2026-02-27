@@ -12,11 +12,13 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar,
     QMessageBox, QFrame, QScrollArea, QGroupBox, QFormLayout, 
     QCheckBox, QPlainTextEdit, QSplitter, QTabWidget, QRadioButton, 
-    QButtonGroup, QAbstractItemView, QMenu
+    QButtonGroup, QAbstractItemView, QMenu, QDialog, QDialogButtonBox
 )
-from PyQt6.QtCore import Qt, QObject, pyqtSignal, QThreadPool, pyqtSlot, QUrl
-from PyQt6.QtGui import QColor, QPixmap, QFont, QTextCursor, QTextCharFormat, QDesktopServices, QPalette, QAction, QCloseEvent
+from PyQt6.QtCore import Qt, QObject, pyqtSignal, QThreadPool, pyqtSlot, QUrl, QRunnable
+from PyQt6.QtGui import QColor, QPixmap, QFont, QTextCursor, QTextCharFormat, QDesktopServices, QPalette, QAction, QCloseEvent, QImage
+from PyQt6 import sip
 
+# Pressupõe-se a existência do módulo de processamento no ambiente
 import processamento as proc
 
 APP_NAME: Final[str] = "SoundStream Pro"
@@ -125,7 +127,7 @@ class LogViewerWidget(QWidget):
         header_layout.addStretch()
         header_layout.addWidget(btn_clear)
         
-        self.text_edit = QPlainTextEdit()
+        self.text_edit = QPlainTextEdit(self)
         self.text_edit.setReadOnly(True)
         self.text_edit.setObjectName("LogConsole")
         self.text_edit.setMaximumBlockCount(2000) 
@@ -640,7 +642,7 @@ class MainWindow(QMainWindow):
         
         main_layout.addWidget(self.table)
         
-        self.log_viewer = LogViewerWidget()
+        self.log_viewer = LogViewerWidget(main_splitter)
         self.log_viewer.setVisible(False)
         self.qt_log_handler.log_record.connect(self.log_viewer.append_log)
         
@@ -753,11 +755,15 @@ class MainWindow(QMainWindow):
             if path_obj.exists() and path_obj.is_dir():
                 QDesktopServices.openUrl(QUrl.fromLocalFile(str(path_obj)))
             else:
-                QMessageBox.warning(self, "Warning", "The specified directory does not exist or cannot be accessed.")
+                QMessageBox.warning(self, "Aviso", "O diretório especificado não existe ou está inacessível.")
 
     def queue_download(self) -> None:
         if not self._current_meta: return
+        
+        # Extração de dados com validação de ponteiros sip
         data = self.inspector.get_config_delta()
+        if not data:
+            return
         
         config = proc.DownloadJobConfig(
             job_id=str(uuid.uuid4()),
@@ -793,8 +799,10 @@ class MainWindow(QMainWindow):
 
         self._spawn_download(config)
         
-        self.inspector.setVisible(False)
-        self.action_bar.setVisible(False)
+        if not sip.isdeleted(self.inspector):
+            self.inspector.setVisible(False)
+        if not sip.isdeleted(self.action_bar):
+            self.action_bar.setVisible(False)
         self.url_input.clear()
 
     def _spawn_download(self, config: proc.DownloadJobConfig) -> None:
@@ -848,6 +856,7 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str, float, str)
     def update_progress(self, job_id: str, pct: float, speed: str) -> None:
+        if sip.isdeleted(self) or sip.isdeleted(self.table): return
         row = self.get_row_by_id(job_id)
         if row >= 0:
             widget = self.table.cellWidget(row, 3)
@@ -860,6 +869,7 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str, str)
     def update_status(self, job_id: str, msg: str) -> None:
+        if sip.isdeleted(self) or sip.isdeleted(self.table): return
         row = self.get_row_by_id(job_id)
         if row >= 0:
             item = self.table.item(row, 2)
