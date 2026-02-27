@@ -388,29 +388,27 @@ class DownloadWorker(QRunnable):
             }
         }
 
+        if self.config.ffmpeg_path:
+            opts['ffmpeg_location'] = self.config.ffmpeg_path
+
         if self.config.use_browser_cookies:
-            self._logger.info("Using cookies from Chrome browser.")
             opts['cookiesfrombrowser'] = ('chrome', )
 
+        self._configure_format_opts(opts)
+        self._configure_metadata_opts(opts)
+        self._apply_raw_custom_flags(opts)
+
+        return opts
+
+    def _configure_format_opts(self, opts: dict[str, Any]) -> None:
         if self.config.media_type == MediaType.AUDIO:
             opts['format'] = 'bestaudio/best'
-            opts['postprocessors'].append({
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': self.config.format_container,
-                'preferredquality': self.config.audio_bitrate if self.config.audio_bitrate != '0' else None,
-            })
-            if self.config.audio_sample_rate > 0:
-                opts.setdefault('postprocessor_args', {}).setdefault('FFmpegExtractAudio', []).extend(
-                    ['-ar', str(self.config.audio_sample_rate)]
-                )
-            if self.config.normalize_audio:
-                opts.setdefault('postprocessor_args', {}).setdefault('FFmpegExtractAudio', []).extend(
-                    ['-af', 'loudnorm=I=-14:TP=-1.5:LRA=11']
-                )
-
+            
         elif self.config.media_type == MediaType.VIDEO:
             res_map = {"4K": 2160, "2K": 1440, "1080p": 1080, "720p": 720, "480p": 480}
-            target_h = res_map.get(self.config.quality_preset)
+            match = re.search(r'(\d+)p', self.config.quality_preset)
+            target_h = int(match.group(1)) if match else res_map.get(self.config.quality_preset)
+            
             res_filter = f"[height<={target_h}]" if target_h else ""
             
             v_fmt = f"bestvideo{res_filter}"
@@ -426,15 +424,84 @@ class DownloadWorker(QRunnable):
             opts['format'] = f"{v_fmt}+{a_fmt}/best{res_filter}"
             opts['merge_output_format'] = self.config.format_container
 
+    def _configure_metadata_opts(self, opts: dict[str, Any]) -> None:
+        if self.config.media_type == MediaType.AUDIO:
+            return
+            
         if self.config.embed_metadata:
             opts['postprocessors'].append({'key': 'FFmpegMetadata', 'add_chapters': True, 'add_metadata': True})
-
+            
+            meta_args: List[str] = []
+            if getattr(self.config, 'meta_title', ''):
+                meta_args.extend(['-metadata', f'title={self.config.meta_title}'])
+            if getattr(self.config, 'meta_artist', ''):
+                meta_args.extend(['-metadata', f'artist={self.config.meta_artist}'])
+                meta_args.extend(['-metadata', f'album_artist={self.config.meta_artist}'])
+            if getattr(self.config, 'meta_album', ''):
+                meta_args.extend(['-metadata', f'album={self.config.meta_album}'])
+            if getattr(self.config, 'meta_genre', ''):
+                meta_args.extend(['-metadata', f'genre={self.config.meta_genre}'])
+            if getattr(self.config, 'meta_date', ''):
+                meta_args.extend(['-metadata', f'date={self.config.meta_date[:4]}'])
+            if getattr(self.config, 'meta_desc', ''):
+                meta_args.extend(['-metadata', f'description={self.config.meta_desc}'])
+                meta_args.extend(['-metadata', f'comment={self.config.meta_desc}'])
+                
+            if meta_args:
+                opts.setdefault('postprocessor_args', {})['FFmpegMetadata'] = meta_args
+                
         if self.config.embed_thumbnail:
             opts['postprocessors'].append({'key': 'EmbedThumbnail'})
+            
+        if self.config.embed_subs:
+            opts['writesubtitles'] = True
 
-        return opts
+    def _apply_raw_custom_flags(self, opts: dict[str, Any]) -> None:
+        if not self.config.custom_flags:
+            return
+            
+        try:
+            tokens = shlex.split(self.config.custom_flags)
+            i = 0
+            while i < len(tokens):
+                flag = tokens[i]
+                if flag.startswith('--'):
+                    key = flag[2:].replace('-', '_')
+                    
+                    if i + 1 < len(tokens) and not tokens[i+1].startswith('--'):
+                        val = tokens[i+1]
+                        i += 2
+                        
+                        if key == 'extractor_args' and ':' in val and '=' in val:
+                            extractor, rest = val.split(':', 1)
+                            arg_k, arg_v = rest.split('=', 1)
+                            opts.setdefault('extractor_args', {}).setdefault(extractor, {})[arg_k] = [arg_v]
+                        else:
+                            opts[key] = val
+                    else:
+                        opts[key] = True
+                        i += 1
+                else:
+                    i += 1
+        except ValueError as e:
+            self._logger.error(f"Erro de Análise Sintática (Shlex Exception): {e}")
 
-    def _finalize_move(self):
+    def _get_downloaded_filepath(self, info_dict: dict[str, Any]) -> Optional[Path]:
+        req_dl = info_dict.get('requested_downloads')
+        if req_dl and isinstance(req_dl, list):
+            filepath = req_dl[0].get('filepath')
+            if filepath: return Path(filepath)
+            
+        filepath = info_dict.get('filepath')
+        if filepath: return Path(filepath)
+        
+        return None
+
+    def _finalize_move(self) -> None:
+        if self.config.output_template:
+            shutil.rmtree(self._temp_dir, ignore_errors=True)
+            return
+
         dest_dir = self.config.output_path
         dest_dir.mkdir(parents=True, exist_ok=True)
         
@@ -442,31 +509,37 @@ class DownloadWorker(QRunnable):
             if file_p.is_file():
                 target = dest_dir / file_p.name
                 if target.exists():
-                    self._logger.warning(f"Overwriting: {target}")
+                    self._logger.warning(f"Exclusão de arquivo obsoleto por sobreposição de assinatura: {target}")
                     target.unlink()
                 shutil.move(str(file_p), str(target))
         shutil.rmtree(self._temp_dir, ignore_errors=True)
 
     @pyqtSlot()
-    def run(self):
-        self.signals.status.emit(self.config.job_id, "Initializing...")
+    def run(self) -> None:
+        self.broker.emit_status(self.config.job_id, "Inicializando vetor de extração...")
         try:
             ydl_opts = self._build_ydl_opts()
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                self.signals.status.emit(self.config.job_id, "Downloading...")
-                ydl.download([self.config.url])
             
-            if self._is_cancelled: 
-                raise DownloadError("Cancelled")
+            with YtDlpService._network_semaphore:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    self.broker.emit_status(self.config.job_id, "Iniciando transferência (I/O)...")
+                    info_dict = ydl.extract_info(self.config.url, download=True)
             
+            self._check_abort()
+            
+            if self.config.media_type == MediaType.AUDIO:
+                self.broker.emit_status(self.config.job_id, "Executando Motor Matemático DSP (FFmpeg)...")
+                raw_filepath = self._get_downloaded_filepath(cast(Dict[str, Any], info_dict))
+                if raw_filepath:
+                    SubprocessDSPEngine.execute_audio_pipeline(self.config, raw_filepath, cast(Dict[str, Any], info_dict), self._temp_dir, self._logger)
+
             self._finalize_move()
-            self.signals.status.emit(self.config.job_id, "Complete")
-            self.signals.finished.emit()
+            self.broker.emit_status(self.config.job_id, "Concluído")
             
         except Exception as e:
             shutil.rmtree(self._temp_dir, ignore_errors=True)
-            if self._is_cancelled:
-                pass
-            else:
-                self._logger.error(f"Failed: {e}", exc_info=True)
-                self.signals.error.emit(str(e))
+            if not self._is_cancelled:
+                self._logger.error(f"Falha de asserção matemática ou colapso de I/O: {e}", exc_info=True)
+                self.broker.emit_error(str(e))
+        finally:
+            self.broker.emit_finished()

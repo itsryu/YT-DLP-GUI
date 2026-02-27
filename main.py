@@ -480,6 +480,12 @@ class InspectorPanel(QFrame):
         self.stats_lbl.setText(base_info)
 
     def get_config_delta(self) -> Dict[str, Any]:
+        asr_data = self.cb_asr.currentData()
+        audio_sample_rate = 0 if asr_data == "auto" else int(asr_data)
+        
+        bitdepth_text = self.cb_bitdepth.currentText()
+        audio_bit_depth = bitdepth_text.split('-')[0] if "bit" in bitdepth_text else "auto"
+
         return {
             'media_type': proc.MediaType.VIDEO if self.rb_video.isChecked() else proc.MediaType.AUDIO,
             'format_container': self.cb_container.currentText(),
@@ -487,8 +493,14 @@ class InspectorPanel(QFrame):
             'audio_codec': self.cb_acodec.currentText().lower(),
             'quality_preset': self.cb_quality.currentText(),
             'audio_bitrate': self.cb_abitrate.currentData() if self.cb_abitrate.isEnabled() else "0",
-            'audio_sample_rate': self.sb_asr.value(),
+            'audio_sample_rate': audio_sample_rate,
+            'audio_bit_depth': audio_bit_depth, 
             'custom_filename': self.in_filename.text().strip() or "output",
+            
+            'output_template': self.in_output_tmpl.text().strip(),
+            'ffmpeg_path': self.in_ffmpeg_path.text().strip(),
+            'custom_flags': self.in_custom_flags.text().strip(),
+            
             'meta_title': self.in_title.text(),
             'meta_artist': self.in_artist.text(),
             'meta_album': self.in_album.text(),
@@ -773,14 +785,20 @@ class MainWindow(QMainWindow):
             normalize_audio=data['norm_audio'],
             use_browser_cookies=data['use_cookies']
         )
+        
+        object.__setattr__(config, "audio_bit_depth", data.get('audio_bit_depth', 'auto'))
+        object.__setattr__(config, "output_template", data.get('output_template', ''))
+        object.__setattr__(config, "ffmpeg_path", data.get('ffmpeg_path', ''))
+        object.__setattr__(config, "custom_flags", data.get('custom_flags', ''))
+
         self._spawn_download(config)
         
         self.inspector.setVisible(False)
         self.action_bar.setVisible(False)
         self.url_input.clear()
 
-    def _spawn_download(self, config: proc.DownloadJobConfig):
-        runnable = proc.DownloadRunnable(config)
+    def _spawn_download(self, config: proc.DownloadJobConfig) -> None:
+        runnable = proc.DownloadWorker(config)
         runnable.signals.progress.connect(self.update_progress)
         runnable.signals.status.connect(self.update_status)
         runnable.signals.finished.connect(lambda: self.on_job_finished(config.job_id))
