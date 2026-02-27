@@ -11,8 +11,8 @@ from PyQt6.QtWidgets import (
     QPushButton, QLineEdit, QLabel, QComboBox, QFileDialog,
     QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar,
     QMessageBox, QFrame, QScrollArea, QGroupBox, QFormLayout, 
-    QCheckBox, QSpinBox, QPlainTextEdit,
-    QSplitter, QTabWidget, QRadioButton, QButtonGroup, QAbstractItemView, QMenu
+    QCheckBox, QPlainTextEdit, QSplitter, QTabWidget, QRadioButton, 
+    QButtonGroup, QAbstractItemView, QMenu
 )
 from PyQt6.QtCore import Qt, QObject, pyqtSignal, QThreadPool, pyqtSlot, QUrl
 from PyQt6.QtGui import QColor, QPixmap, QFont, QTextCursor, QTextCharFormat, QDesktopServices, QPalette, QAction, QCloseEvent
@@ -20,10 +20,9 @@ from PyQt6.QtGui import QColor, QPixmap, QFont, QTextCursor, QTextCharFormat, QD
 import processamento as proc
 
 APP_NAME: Final[str] = "SoundStream Pro"
-VERSION: Final[str] = "7.1.0"
+VERSION: Final[str] = "7.3.0"
 DEFAULT_DOWNLOAD_DIR: Final[Path] = Path.home() / "Downloads"
 MAX_CONCURRENT_DOWNLOADS: Final[int] = 3
-
 
 class ThemeManager:
     @staticmethod
@@ -227,13 +226,24 @@ class InspectorPanel(QFrame):
         for k in ["320", "256", "192", "128", "96"]:
             self.cb_abitrate.addItem(f"{k} kbps", k)
             
-        self.sb_asr = QSpinBox()
-        self.sb_asr.setRange(0, 192000)
-        self.sb_asr.setSpecialValueText("Auto")
-        self.sb_asr.setSuffix(" Hz")
+        self.cb_asr = QComboBox()
+        self.cb_asr.addItem("Auto", "auto")
+        self.cb_asr.addItem("44.1 kHz", "44100")
+        self.cb_asr.addItem("48.0 kHz", "48000")
+        self.cb_asr.addItem("88.2 kHz", "88200")
+        self.cb_asr.addItem("96.0 kHz", "96000")
+        self.cb_asr.addItem("192.0 kHz", "192000")
+        self.cb_asr.setToolTip("Taxa de Amostragem (Sample Rate). Vital para compatibilidade com DACs e hardware automotivo.")
+        
+        self.cb_bitdepth = QComboBox()
+        self.cb_bitdepth.addItems(["Auto", "16-bit", "24-bit", "32-bit"])
+        self.cb_bitdepth.setToolTip("Bit depth constraint for lossless formats.")
         
         self.cb_quality = QComboBox()
-        self.cb_quality.addItems(["Best Available", "4K", "2K", "1080p", "720p", "480p"])
+        self.cb_quality.addItems([
+            "Best Available", "8K (4320p)", "4K (2160p)", "1440p (2K)", 
+            "1080p60", "1080p", "720p60", "720p", "480p", "360p"
+        ])
         
         self.cb_vcodec = QComboBox()
         self.cb_vcodec.addItems(["Best", "H264", "VP9", "AV1"])
@@ -244,6 +254,7 @@ class InspectorPanel(QFrame):
         self.lbl_container = QLabel("Format:")
         self.lbl_abitrate = QLabel("Bitrate:")
         self.lbl_asr = QLabel("Sample Rate:")
+        self.lbl_bitdepth = QLabel("Bit Depth:")
         self.lbl_quality = QLabel("Resolution:")
         self.lbl_vcodec = QLabel("Video Codec:")
         self.lbl_acodec = QLabel("Audio Codec:")
@@ -259,7 +270,9 @@ class InspectorPanel(QFrame):
         fmt_grid.addWidget(self.lbl_abitrate, 3, 0)
         fmt_grid.addWidget(self.cb_abitrate, 3, 1)
         fmt_grid.addWidget(self.lbl_asr, 3, 2)
-        fmt_grid.addWidget(self.sb_asr, 3, 3)
+        fmt_grid.addWidget(self.cb_asr, 3, 3)
+        fmt_grid.addWidget(self.lbl_bitdepth, 4, 0)
+        fmt_grid.addWidget(self.cb_bitdepth, 4, 1)
         
         fmt_layout.addLayout(fmt_grid)
         fmt_layout.addStretch()
@@ -296,6 +309,8 @@ class InspectorPanel(QFrame):
         tab_adv = QWidget()
         adv_layout = QVBoxLayout(tab_adv)
         
+        chk_group = QGroupBox("Standard Options")
+        chk_layout = QVBoxLayout(chk_group)
         self.chk_meta = QCheckBox("Embed Metadata")
         self.chk_thumb = QCheckBox("Embed Thumbnail")
         self.chk_subs = QCheckBox("Download Subtitles")
@@ -306,16 +321,55 @@ class InspectorPanel(QFrame):
         self.chk_thumb.setChecked(True)
         self.chk_cookies.setToolTip("Attempts to extract cookies from Chrome to bypass 403 Forbidden errors.")
         
-        adv_layout.addWidget(self.chk_meta)
-        adv_layout.addWidget(self.chk_thumb)
-        adv_layout.addWidget(self.chk_subs)
-        adv_layout.addWidget(self.chk_norm)
-        adv_layout.addWidget(self.chk_cookies)
+        chk_layout.addWidget(self.chk_meta)
+        chk_layout.addWidget(self.chk_thumb)
+        chk_layout.addWidget(self.chk_subs)
+        chk_layout.addWidget(self.chk_norm)
+        chk_layout.addWidget(self.chk_cookies)
+        
+        dev_group = QGroupBox("Developer and Customization")
+        dev_form = QFormLayout(dev_group)
+        
+        tmpl_layout = QHBoxLayout()
+        tmpl_layout.setContentsMargins(0, 0, 0, 0)
+        self.in_output_tmpl = QLineEdit("%(title)s [%(id)s].%(ext)s")
+        self.in_output_tmpl.setPlaceholderText("Digite o template de nomenclatura...")
+        
+        btn_tmpl_help = QPushButton("?")
+        btn_tmpl_help.setFixedWidth(30)
+        btn_tmpl_help.setToolTip("Tutorial: Como utilizar variáveis dinâmicas de Output.")
+        btn_tmpl_help.clicked.connect(self._show_template_tutorial)
+        
+        tmpl_layout.addWidget(self.in_output_tmpl)
+        tmpl_layout.addWidget(btn_tmpl_help)
+        
+        self.in_ffmpeg_path = QLineEdit()
+        self.in_ffmpeg_path.setPlaceholderText("Deixe em branco para PATH do sistema")
+        btn_browse_ffmpeg = QPushButton("Browse")
+        btn_browse_ffmpeg.clicked.connect(self._browse_ffmpeg)
+        
+        ffmpeg_layout = QHBoxLayout()
+        ffmpeg_layout.setContentsMargins(0, 0, 0, 0)
+        ffmpeg_layout.addWidget(self.in_ffmpeg_path)
+        ffmpeg_layout.addWidget(btn_browse_ffmpeg)
+        
+        self.in_custom_flags = QLineEdit()
+        self.in_custom_flags.setPlaceholderText("Ex: --extractor-args \"youtube:po_token=android.gvs+TOKEN\"")
+        self.in_custom_flags.setToolTip("Argumentos raw para injeção no wrapper do yt-dlp (separados por espaço).")
+        
+        dev_form.addRow("Output Template:", tmpl_layout)
+        dev_form.addRow("FFmpeg Path:", ffmpeg_layout)
+        dev_form.addRow("Custom Flags:", self.in_custom_flags)
+        
+        adv_layout.addWidget(chk_group)
+        adv_layout.addWidget(dev_group)
         adv_layout.addStretch()
 
-        self.tabs.addTab(tab_format, "Format & Quality")
-        self.tabs.addTab(tab_meta, "Metadata & File")
-        self.tabs.addTab(tab_adv, "Advanced")
+        # Substituição do ampersand ('&') comercial problemático por 'and' para evitar 
+        # acionamento errôneo da classe de atalhos embutidos do PyQt6.
+        self.tabs.addTab(tab_format, "Format and Quality")
+        self.tabs.addTab(tab_meta, "Metadata and File")
+        self.tabs.addTab(tab_adv, "Advanced Configuration")
 
         right_layout.addWidget(type_grp)
         right_layout.addWidget(self.tabs)
@@ -325,7 +379,46 @@ class InspectorPanel(QFrame):
         
         self._update_ui_mode()
 
-    def set_metadata(self, meta: proc.MediaMetadata):
+    def _show_template_tutorial(self) -> None:
+        """Exibe diretrizes acadêmicas sobre injeção de templates estruturados no wrapper."""
+        tutorial_html = (
+            "<h3>Guia Acadêmico de Nomenclatura Dinâmica (Output Template)</h3>"
+            "<p>O template de saída orquestra a montagem estruturada dos diretórios e arquivos "
+            "com base em metadados injetados durante a fase de extração.</p>"
+            "<br>"
+            "<b>Variáveis de Contexto (Chaves de Dicionário):</b>"
+            "<ul>"
+            "<li><code>%(title)s</code>: Título literal da faixa ou vídeo</li>"
+            "<li><code>%(ext)s</code>: Extensão codificada (ex: flac, mp3, mp4)</li>"
+            "<li><code>%(uploader)s</code>: Entidade ou canal remetente</li>"
+            "<li><code>%(upload_date)s</code>: Data de transmissão original (YYYYMMDD)</li>"
+            "<li><code>%(playlist)s</code>: Nome do array contêiner (Playlist/Álbum)</li>"
+            "<li><code>%(playlist_index)s</code>: Índice sequencial (Track Number)</li>"
+            "</ul>"
+            "<br>"
+            "<b>Arquiteturas Recomendadas (Exemplos):</b>"
+            "<ul>"
+            "<li><b>Padrão Limpo:</b><br><code>%(title)s.%(ext)s</code></li>"
+            "<li><b>Identidade Única (Safe Hash):</b><br><code>%(title)s [%(id)s].%(ext)s</code></li>"
+            "<li><b>Construção de Árvore de Diretórios (Álbum):</b><br><code>%(uploader)s/%(playlist)s/%(playlist_index)s - %(title)s.%(ext)s</code></li>"
+            "</ul>"
+            "<br>"
+            "<p><i>Nota de Engenharia (Bypass HTTP 403):</i> Devido a recentes restrições arquiteturais "
+            "do YouTube em requisições de clientes emulados (Android), certas coletas de áudio necessitam "
+            "de um GVS PO Token. Insira no campo <b>Custom Flags</b> o argumento:</p>"
+            "<code>--extractor-args \"youtube:po_token=android.gvs+SEU_TOKEN\"</code>"
+        )
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Tutorial: yt-dlp Output Templates")
+        msg_box.setText(tutorial_html)
+        msg_box.exec()
+
+    def _browse_ffmpeg(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Select FFmpeg Executable", "", "Executables (*.exe);;All Files (*)")
+        if path:
+            self.in_ffmpeg_path.setText(path)
+
+    def set_metadata(self, meta: proc.MediaMetadata) -> None:
         self._current_meta = meta
         safe_filename = re.sub(r'[\\/*?:"<>|]', "", meta.title)
         self.in_filename.setText(safe_filename)
@@ -348,7 +441,7 @@ class InspectorPanel(QFrame):
         if is_video:
             self.cb_container.addItems(["mp4", "mkv", "webm"])
         else:
-            self.cb_container.addItems(["mp3", "flac", "wav", "m4a", "opus"])
+            self.cb_container.addItems(["flac", "mp3", "wav", "m4a", "opus"])
         self.cb_container.blockSignals(False)
         self.cb_container.setCurrentIndex(0)
         
@@ -356,23 +449,28 @@ class InspectorPanel(QFrame):
         for w in video_widgets:
             w.setVisible(is_video)
             
-        audio_widgets = [self.lbl_abitrate, self.cb_abitrate, self.lbl_asr, self.sb_asr]
+        audio_widgets = [self.lbl_abitrate, self.cb_abitrate, self.lbl_asr, self.cb_asr]
         for w in audio_widgets:
             w.setVisible(not is_video)
             
         self.chk_norm.setVisible(not is_video)
         self._on_container_changed(self.cb_container.currentText())
 
-    def _on_container_changed(self, fmt: str):
+    def _on_container_changed(self, fmt: str) -> None:
         is_lossless = fmt in ['flac', 'wav']
+        
         self.cb_abitrate.setEnabled(not is_lossless)
+        self.lbl_bitdepth.setVisible(is_lossless)
+        self.cb_bitdepth.setVisible(is_lossless)
+        
         if is_lossless:
             self.lbl_abitrate.setText("Bitrate (Lossless):")
         else:
             self.lbl_abitrate.setText("Bitrate:")
+            
         self._recalc_estimate()
 
-    def _recalc_estimate(self):
+    def _recalc_estimate(self) -> None:
         if not self._current_meta: return
         base_info = (
             f"<b>Duration:</b> {self._current_meta.display_duration}<br>"
