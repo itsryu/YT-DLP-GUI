@@ -123,10 +123,10 @@ class LogViewerWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         
         header_layout = QHBoxLayout()
-        lbl = QLabel("SYSTEM LOGS / DEBUG CONSOLE")
+        lbl = QLabel("REGISTOS DO SISTEMA / CONSOLA DE DEPURAÇÃO", self)
         lbl.setObjectName("LogHeader")
         
-        btn_clear = QPushButton("Clear")
+        btn_clear = QPushButton("Limpar", self)
         btn_clear.setFixedSize(60, 24)
         btn_clear.clicked.connect(self.clear_logs)
         
@@ -389,16 +389,17 @@ class InspectorPanel(QFrame):
         main_layout.setContentsMargins(20, 20, 20, 20)
         main_layout.setSpacing(20)
 
-        left_col = QWidget()
+        # Ancora rigorosa das instâncias ao escopo da QFrame (self)
+        left_col = QWidget(self)
         left_layout = QVBoxLayout(left_col)
         
-        self.thumb_lbl = QLabel("No Preview")
+        self.thumb_lbl = QLabel("Sem Pré-visualização", left_col)
         self.thumb_lbl.setFixedSize(320, 180)
         self.thumb_lbl.setObjectName("ThumbLabel")
         self.thumb_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.thumb_lbl.setScaledContents(True)
         
-        self.stats_lbl = QLabel("Ready to Analyze")
+        self.stats_lbl = QLabel("Pronto para Analisar", left_col)
         self.stats_lbl.setObjectName("StatsLabel")
         self.stats_lbl.setWordWrap(True)
         
@@ -406,16 +407,16 @@ class InspectorPanel(QFrame):
         left_layout.addWidget(self.stats_lbl)
         left_layout.addStretch()
 
-        right_container = QWidget()
+        right_container = QWidget(self)
         right_layout = QVBoxLayout(right_container)
         
-        type_grp = QGroupBox("Select Media Type")
-        type_layout = QHBoxLayout()
-        self.rb_video = QRadioButton("Video + Audio")
-        self.rb_audio = QRadioButton("Audio Only")
+        type_grp = QGroupBox("Selecionar Tipo de Multimédia", right_container)
+        type_layout = QHBoxLayout(type_grp)
+        self.rb_video = QRadioButton("Vídeo + Áudio", type_grp)
+        self.rb_audio = QRadioButton("Apenas Áudio", type_grp)
         self.rb_audio.setChecked(True)
         
-        self.btn_grp_type = QButtonGroup()
+        self.btn_grp_type = QButtonGroup(self)
         self.btn_grp_type.addButton(self.rb_video)
         self.btn_grp_type.addButton(self.rb_audio)
         
@@ -425,53 +426,51 @@ class InspectorPanel(QFrame):
         type_layout.addWidget(self.rb_audio)
         type_layout.addWidget(self.rb_video)
         type_layout.addStretch()
-        type_grp.setLayout(type_layout)
         
-        self.tabs = QTabWidget()
+        self.tabs = QTabWidget(right_container)
         
-        tab_format = QWidget()
+        # --- TAB FORMATO ---
+        tab_format = QWidget(self.tabs)
         fmt_layout = QVBoxLayout(tab_format)
         fmt_grid = QGridLayout()
         
-        self.cb_container = QComboBox()
+        self.cb_container = QComboBox(tab_format)
         self.cb_container.currentTextChanged.connect(self._on_container_changed)
         
-        self.cb_abitrate = QComboBox()
+        self.cb_abitrate = QComboBox(tab_format)
         for k in ["320", "256", "192", "128", "96"]:
             self.cb_abitrate.addItem(f"{k} kbps", k)
             
-        self.cb_asr = QComboBox()
+        self.cb_asr = QComboBox(tab_format)
         self.cb_asr.addItem("Auto", "auto")
         self.cb_asr.addItem("44.1 kHz", "44100")
         self.cb_asr.addItem("48.0 kHz", "48000")
         self.cb_asr.addItem("88.2 kHz", "88200")
         self.cb_asr.addItem("96.0 kHz", "96000")
         self.cb_asr.addItem("192.0 kHz", "192000")
-        self.cb_asr.setToolTip("Taxa de Amostragem (Sample Rate). Vital para compatibilidade com DACs e hardware automotivo.")
         
-        self.cb_bitdepth = QComboBox()
+        self.cb_bitdepth = QComboBox(tab_format)
         self.cb_bitdepth.addItems(["Auto", "16-bit", "24-bit", "32-bit"])
-        self.cb_bitdepth.setToolTip("Bit depth constraint for lossless formats.")
         
-        self.cb_quality = QComboBox()
+        self.cb_quality = QComboBox(tab_format)
         self.cb_quality.addItems([
-            "Best Available", "8K (4320p)", "4K (2160p)", "1440p (2K)", 
+            "Melhor Disponível", "8K (4320p)", "4K (2160p)", "1440p (2K)", 
             "1080p60", "1080p", "720p60", "720p", "480p", "360p"
         ])
         
-        self.cb_vcodec = QComboBox()
-        self.cb_vcodec.addItems(["Best", "H264", "VP9", "AV1"])
+        self.cb_vcodec = QComboBox(tab_format)
+        self.cb_vcodec.addItems(["Melhor", "H264", "VP9", "AV1"])
         
-        self.cb_acodec = QComboBox()
-        self.cb_acodec.addItems(["Best", "AAC", "MP3", "Opus"])
+        self.cb_acodec = QComboBox(tab_format)
+        self.cb_acodec.addItems(["Melhor", "AAC", "MP3", "Opus"])
 
-        self.lbl_container = QLabel("Format:")
-        self.lbl_abitrate = QLabel("Bitrate:")
-        self.lbl_asr = QLabel("Sample Rate:")
-        self.lbl_bitdepth = QLabel("Bit Depth:")
-        self.lbl_quality = QLabel("Resolution:")
-        self.lbl_vcodec = QLabel("Video Codec:")
-        self.lbl_acodec = QLabel("Audio Codec:")
+        self.lbl_container = QLabel("Formato:", tab_format)
+        self.lbl_abitrate = QLabel("Bitrate:", tab_format)
+        self.lbl_asr = QLabel("Taxa de Amostragem:", tab_format)
+        self.lbl_bitdepth = QLabel("Profundidade de Bits:", tab_format)
+        self.lbl_quality = QLabel("Resolução:", tab_format)
+        self.lbl_vcodec = QLabel("Codec de Vídeo:", tab_format)
+        self.lbl_acodec = QLabel("Codec de Áudio:", tab_format)
         
         fmt_grid.addWidget(self.lbl_container, 0, 0)
         fmt_grid.addWidget(self.cb_container, 0, 1)
@@ -546,25 +545,23 @@ class InspectorPanel(QFrame):
         chk_layout.addWidget(self.chk_norm)
         chk_layout.addWidget(self.chk_cookies)
         
-        dev_group = QGroupBox("Developer and Customization")
+        dev_group = QGroupBox("Desenvolvimento e Personalização", tab_adv)
         dev_form = QFormLayout(dev_group)
         
         tmpl_layout = QHBoxLayout()
         tmpl_layout.setContentsMargins(0, 0, 0, 0)
-        self.in_output_tmpl = QLineEdit("%(title)s [%(id)s].%(ext)s")
-        self.in_output_tmpl.setPlaceholderText("Digite o template de nomenclatura...")
+        # Template atualizado para Música - Artista conforme solicitado
+        self.in_output_tmpl = QLineEdit("%(title)s - %(artist)s.%(ext)s", dev_group)
         
-        btn_tmpl_help = QPushButton("?")
+        btn_tmpl_help = QPushButton("?", dev_group)
         btn_tmpl_help.setFixedWidth(30)
-        btn_tmpl_help.setToolTip("Tutorial: Como utilizar variáveis dinâmicas de Output.")
         btn_tmpl_help.clicked.connect(self._show_template_tutorial)
         
         tmpl_layout.addWidget(self.in_output_tmpl)
         tmpl_layout.addWidget(btn_tmpl_help)
         
-        self.in_ffmpeg_path = QLineEdit()
-        self.in_ffmpeg_path.setPlaceholderText("Deixe em branco para PATH do sistema")
-        btn_browse_ffmpeg = QPushButton("Browse")
+        self.in_ffmpeg_path = QLineEdit(dev_group)
+        btn_browse_ffmpeg = QPushButton("Procurar", dev_group)
         btn_browse_ffmpeg.clicked.connect(self._browse_ffmpeg)
         
         ffmpeg_layout = QHBoxLayout()
@@ -572,23 +569,20 @@ class InspectorPanel(QFrame):
         ffmpeg_layout.addWidget(self.in_ffmpeg_path)
         ffmpeg_layout.addWidget(btn_browse_ffmpeg)
         
-        self.in_custom_flags = QLineEdit()
-        self.in_custom_flags.setPlaceholderText("Ex: --extractor-args \"youtube:po_token=android.gvs+TOKEN\"")
-        self.in_custom_flags.setToolTip("Argumentos raw para injeção no wrapper do yt-dlp (separados por espaço).")
+        self.in_custom_flags = QLineEdit(dev_group)
         
-        dev_form.addRow("Output Template:", tmpl_layout)
-        dev_form.addRow("FFmpeg Path:", ffmpeg_layout)
-        dev_form.addRow("Custom Flags:", self.in_custom_flags)
+        dev_form.addRow("Template de Saída:", tmpl_layout)
+        dev_form.addRow("Caminho FFmpeg:", ffmpeg_layout)
+        dev_form.addRow("Flags Personalizadas:", self.in_custom_flags)
         
         adv_layout.addWidget(chk_group)
         adv_layout.addWidget(dev_group)
         adv_layout.addStretch()
 
-        # Substituição do ampersand ('&') comercial problemático por 'and' para evitar 
-        # acionamento errôneo da classe de atalhos embutidos do PyQt6.
-        self.tabs.addTab(tab_format, "Format and Quality")
-        self.tabs.addTab(tab_meta, "Metadata and File")
-        self.tabs.addTab(tab_adv, "Advanced Configuration")
+        # Acoplar Tabs
+        self.tabs.addTab(tab_format, "Formato e Qualidade")
+        self.tabs.addTab(tab_meta, "Metadados e Ficheiro")
+        self.tabs.addTab(tab_adv, "Configuração Avançada")
 
         right_layout.addWidget(type_grp)
         right_layout.addWidget(self.tabs)
@@ -699,23 +693,32 @@ class InspectorPanel(QFrame):
         msg_box.exec()
 
     def _browse_ffmpeg(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Select FFmpeg Executable", "", "Executables (*.exe);;All Files (*)")
+        path, _ = QFileDialog.getOpenFileName(self, "Selecionar Executável FFmpeg", "", "Executáveis (*.exe);;Todos os Ficheiros (*)")
         if path:
             self.in_ffmpeg_path.setText(path)
 
     def set_metadata(self, meta: proc.MediaMetadata) -> None:
+        if sip.isdeleted(self) or sip.isdeleted(self.in_filename): return
         self._current_meta = meta
-        safe_filename = re.sub(r'[\\/*?:"<>|]', "", meta.title)
-        self.in_filename.setText(safe_filename)
-        self.in_title.setText(meta.title)
-        self.in_artist.setText(meta.artist)
-        self.in_album.setText(meta.album)
-        self.in_date.setText(meta.upload_date[:4] if meta.upload_date else "")
-        self.in_desc.setPlainText(meta.description)
-        self.in_genre.clear()
+        
+        # Sanitização agressiva para evitar Errno 22 (caracteres ilegais no Windows)
+        sanitized_title = re.sub(r'[\x00-\x1f\x7f]', '', meta.title)
+        sanitized_title = re.sub(r'[<>:"/\\|?*]', '', sanitized_title)
+        sanitized_title = re.sub(r'\s+', ' ', sanitized_title).strip()
+        
+        self.in_filename.setText(sanitized_title)
+        
+        if not sip.isdeleted(self.in_title): self.in_title.setText(meta.title)
+        if not sip.isdeleted(self.in_artist): self.in_artist.setText(meta.artist)
+        if not sip.isdeleted(self.in_album): self.in_album.setText(meta.album)
+        if not sip.isdeleted(self.in_date): self.in_date.setText(meta.upload_date[:4] if meta.upload_date else "")
+        if not sip.isdeleted(self.in_desc): self.in_desc.setPlainText(meta.description)
+        if not sip.isdeleted(self.in_genre): self.in_genre.clear()
+        
         self._recalc_estimate()
 
     def set_thumbnail(self, pixmap: QPixmap) -> None:
+        if sip.isdeleted(self) or sip.isdeleted(self.thumb_lbl): return
         self.thumb_lbl.setPixmap(pixmap)
 
     def _update_ui_mode(self) -> None:
@@ -756,47 +759,54 @@ class InspectorPanel(QFrame):
         self._recalc_estimate()
 
     def _recalc_estimate(self) -> None:
-        if not self._current_meta: return
+        if sip.isdeleted(self) or sip.isdeleted(self.stats_lbl) or not self._current_meta: return
         base_info = (
-            f"<b>Duration:</b> {self._current_meta.display_duration}<br>"
-            f"<b>Source:</b> {self._current_meta.width}x{self._current_meta.height} @ {self._current_meta.fps}fps<br>"
-            f"<b>Channel:</b> {self._current_meta.channel}"
+            f"<b>Duração:</b> {self._current_meta.display_duration}<br>"
+            f"<b>Origem:</b> {self._current_meta.width}x{self._current_meta.height} @ {self._current_meta.fps}fps<br>"
+            f"<b>Canal:</b> {self._current_meta.channel}"
         )
         self.stats_lbl.setText(base_info)
 
     def get_config_delta(self) -> Dict[str, Any]:
-        asr_data = self.cb_asr.currentData()
+        """
+        Extrai as configurações atuais da interface de forma thread-safe.
+        Verifica se os objetos subjacentes em C++ ainda existem para evitar RuntimeErrors.
+        """
+        if sip.isdeleted(self) or sip.isdeleted(self.tabs):
+            return {}
+
+        asr_data = self.cb_asr.currentData() if not sip.isdeleted(self.cb_asr) else "auto"
         audio_sample_rate = 0 if asr_data == "auto" else int(asr_data)
         
-        bitdepth_text = self.cb_bitdepth.currentText()
+        bitdepth_text = self.cb_bitdepth.currentText() if not sip.isdeleted(self.cb_bitdepth) else "Auto"
         audio_bit_depth = bitdepth_text.split('-')[0] if "bit" in bitdepth_text else "auto"
 
         return {
             'media_type': proc.MediaType.VIDEO if self.rb_video.isChecked() else proc.MediaType.AUDIO,
-            'format_container': self.cb_container.currentText(),
-            'video_codec': self.cb_vcodec.currentText().lower(),
-            'audio_codec': self.cb_acodec.currentText().lower(),
-            'quality_preset': self.cb_quality.currentText(),
-            'audio_bitrate': self.cb_abitrate.currentData() if self.cb_abitrate.isEnabled() else "0",
+            'format_container': self.cb_container.currentText() if not sip.isdeleted(self.cb_container) else "mp3",
+            'video_codec': self.cb_vcodec.currentText().lower() if not sip.isdeleted(self.cb_vcodec) else "best",
+            'audio_codec': self.cb_acodec.currentText().lower() if not sip.isdeleted(self.cb_acodec) else "best",
+            'quality_preset': self.cb_quality.currentText() if not sip.isdeleted(self.cb_quality) else "Best",
+            'audio_bitrate': self.cb_abitrate.currentData() if not sip.isdeleted(self.cb_abitrate) and self.cb_abitrate.isEnabled() else "0",
             'audio_sample_rate': audio_sample_rate,
             'audio_bit_depth': audio_bit_depth, 
-            'custom_filename': self.in_filename.text().strip() or "output",
+            'custom_filename': self.in_filename.text().strip() if not sip.isdeleted(self.in_filename) else "output",
             
-            'output_template': self.in_output_tmpl.text().strip(),
-            'ffmpeg_path': self.in_ffmpeg_path.text().strip(),
-            'custom_flags': self.in_custom_flags.text().strip(),
+            'output_template': self.in_output_tmpl.text().strip() if not sip.isdeleted(self.in_output_tmpl) else "",
+            'ffmpeg_path': self.in_ffmpeg_path.text().strip() if not sip.isdeleted(self.in_ffmpeg_path) else "",
+            'custom_flags': self.in_custom_flags.text().strip() if not sip.isdeleted(self.in_custom_flags) else "",
             
-            'meta_title': self.in_title.text(),
-            'meta_artist': self.in_artist.text(),
-            'meta_album': self.in_album.text(),
-            'meta_genre': self.in_genre.text(),
-            'meta_date': self.in_date.text(),
-            'meta_desc': self.in_desc.toPlainText(),
-            'embed_meta': self.chk_meta.isChecked(),
-            'embed_thumb': self.chk_thumb.isChecked(),
-            'embed_subs': self.chk_subs.isChecked(),
-            'norm_audio': self.chk_norm.isChecked(),
-            'use_cookies': self.chk_cookies.isChecked(),
+            'meta_title': self.in_title.text() if not sip.isdeleted(self.in_title) else "",
+            'meta_artist': self.in_artist.text() if not sip.isdeleted(self.in_artist) else "",
+            'meta_album': self.in_album.text() if not sip.isdeleted(self.in_album) else "",
+            'meta_genre': self.in_genre.text() if not sip.isdeleted(self.in_genre) else "",
+            'meta_date': self.in_date.text() if not sip.isdeleted(self.in_date) else "",
+            'meta_desc': self.in_desc.toPlainText() if not sip.isdeleted(self.in_desc) else "",
+            'embed_meta': self.chk_meta.isChecked() if not sip.isdeleted(self.chk_meta) else True,
+            'embed_thumb': self.chk_thumb.isChecked() if not sip.isdeleted(self.chk_thumb) else True,
+            'embed_subs': self.chk_subs.isChecked() if not sip.isdeleted(self.chk_subs) else False,
+            'norm_audio': self.chk_norm.isChecked() if not sip.isdeleted(self.chk_norm) else False,
+            'use_cookies': self.chk_cookies.isChecked() if not sip.isdeleted(self.chk_cookies) else False,
         }
 
 class MainWindow(QMainWindow):
@@ -822,12 +832,12 @@ class MainWindow(QMainWindow):
         menu_bar = self.menuBar()
         if menu_bar is None: return
         
-        menu_file = menu_bar.addMenu("Arquivo")
+        menu_file = menu_bar.addMenu("Ficheiro")
         action_exit = QAction("Sair", self)
         action_exit.triggered.connect(self.close)
         menu_file.addAction(action_exit)
 
-        menu_view = menu_bar.addMenu("Exibir")
+        menu_view = menu_bar.addMenu("Ver")
         menu_theme = menu_view.addMenu("Tema")
         
         action_theme_light = QAction("Claro", self)
@@ -855,19 +865,19 @@ class MainWindow(QMainWindow):
         QMessageBox.about(self, "Sobre", f"{APP_NAME} {VERSION}\n\nInterface construída via PyQt6 com arquitetura orientada a eventos.")
 
     def init_ui(self) -> None:
-        central = QWidget()
+        central = QWidget(self)
         self.setCentralWidget(central)
         
-        main_splitter = QSplitter(Qt.Orientation.Vertical)
-        top_container = QWidget()
+        main_splitter = QSplitter(Qt.Orientation.Vertical, central)
+        top_container = QWidget(main_splitter)
         main_layout = QVBoxLayout(top_container)
         main_layout.setContentsMargins(20, 20, 20, 0)
         
         top_bar = QHBoxLayout()
-        header = QLabel(APP_NAME.upper())
+        header = QLabel(APP_NAME.upper(), top_container)
         header.setObjectName("MainHeader")
         
-        self.chk_dev_mode = QCheckBox("Developer Mode")
+        self.chk_dev_mode = QCheckBox("Modo de Desenvolvedor", top_container)
         self.chk_dev_mode.toggled.connect(self.toggle_dev_mode)
         
         top_bar.addWidget(header)
@@ -875,12 +885,12 @@ class MainWindow(QMainWindow):
         top_bar.addWidget(self.chk_dev_mode)
         main_layout.addLayout(top_bar)
 
-        input_frame = QFrame()
+        input_frame = QFrame(top_container)
         input_frame.setObjectName("Panel")
         input_layout = QHBoxLayout(input_frame)
-        self.url_input = QLineEdit()
-        self.url_input.setPlaceholderText("Paste URL (YouTube, Vimeo, SoundCloud)...")
-        self.btn_analyze = QPushButton("Analyze Media")
+        self.url_input = QLineEdit(input_frame)
+        self.url_input.setPlaceholderText("Colar URL...")
+        self.btn_analyze = QPushButton("Analisar Multimédia", input_frame)
         self.btn_analyze.setObjectName("PrimaryAction")
         self.btn_analyze.setFixedHeight(40)
         self.btn_analyze.clicked.connect(self.start_analysis)
@@ -888,33 +898,34 @@ class MainWindow(QMainWindow):
         input_layout.addWidget(self.btn_analyze)
         main_layout.addWidget(input_frame)
 
-        self.inspector = InspectorPanel()
+        # Injeção explícita de parentalidade na criação do Panel
+        self.inspector = InspectorPanel(top_container)
         self.inspector.setVisible(False)
         main_layout.addWidget(self.inspector)
 
-        self.action_bar = QFrame()
+        self.action_bar = QFrame(top_container)
         self.action_bar.setVisible(False)
         action_layout = QHBoxLayout(self.action_bar)
-        self.path_input = QLineEdit(str(DEFAULT_DOWNLOAD_DIR))
+        self.path_input = QLineEdit(str(DEFAULT_DOWNLOAD_DIR), self.action_bar)
         self.path_input.setReadOnly(True)
         
-        btn_path = QPushButton("Change Folder")
+        btn_path = QPushButton("Alterar Pasta", self.action_bar)
         btn_path.clicked.connect(self.browse_folder)
         
-        self.btn_queue = QPushButton("Add to Queue")
+        self.btn_queue = QPushButton("Adicionar à Fila", self.action_bar)
         self.btn_queue.setObjectName("PrimaryAction")
         self.btn_queue.clicked.connect(self.queue_download)
         
-        action_layout.addWidget(QLabel("Output Folder:"))
+        action_layout.addWidget(QLabel("Pasta de Saída:", self.action_bar))
         action_layout.addWidget(self.path_input)
         action_layout.addWidget(btn_path)
         action_layout.addStretch()
         action_layout.addWidget(self.btn_queue)
         main_layout.addWidget(self.action_bar)
 
-        self.table = QTableWidget()
+        self.table = QTableWidget(top_container)
         self.table.setColumnCount(5)
-        self.table.setHorizontalHeaderLabels(["Filename / Title", "Format", "Status", "Progress", "Actions"])
+        self.table.setHorizontalHeaderLabels(["Ficheiro / Título", "Formato", "Estado", "Progresso", "Ações"])
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         header_view = self.table.horizontalHeader()
         if header_view is not None:
@@ -948,22 +959,22 @@ class MainWindow(QMainWindow):
             if cell_item is not None:
                 job_id = cell_item.data(Qt.ItemDataRole.UserRole)
                 
-                action_remove = QAction("Remove from Queue", self)
+                action_remove = QAction("Remover da Fila", self)
                 action_remove.triggered.connect(lambda _, jid=job_id: self._remove_from_queue(jid))
                 menu.addAction(action_remove)
                 
                 if job_id in self.active_runnables:
-                    action_cancel = QAction("Cancel Download (Instant)", self)
+                    action_cancel = QAction("Cancelar Transferência", self)
                     action_cancel.triggered.connect(lambda _, jid=job_id: self.cancel_job(jid))
                     menu.addAction(action_cancel)
                     
                 menu.addSeparator()
             
-        action_open = QAction("Open Output Folder", self)
+        action_open = QAction("Abrir Pasta de Saída", self)
         action_open.triggered.connect(self.open_output_folder)
         menu.addAction(action_open)
         
-        action_clear = QAction("Clear All Completed", self)
+        action_clear = QAction("Limpar Concluídos", self)
         action_clear.triggered.connect(self._clear_finished_jobs)
         menu.addAction(action_clear)
         
@@ -983,7 +994,7 @@ class MainWindow(QMainWindow):
     def _clear_finished_jobs(self) -> None:
         for row in range(self.table.rowCount() - 1, -1, -1):
             status_item = self.table.item(row, 2)
-            if status_item is not None and status_item.text() in ["✔ Done", "✘ Error", "Cancelled"]:
+            if status_item is not None and status_item.text() in ["✔ Concluído", "✘ Erro", "Cancelado"]:
                 self.table.removeRow(row)
 
     def toggle_dev_mode(self, checked: bool) -> None:
@@ -995,40 +1006,47 @@ class MainWindow(QMainWindow):
         if not url: return
         
         if not proc.YtDlpService.validate_url(url):
-            QMessageBox.warning(self, "Invalid URL", "The provided URL pattern is not supported.\nPlease verify the link and try again.")
+            QMessageBox.warning(self, "URL Inválido", "O padrão de URL fornecido não é suportado.")
             return
         
         self.btn_analyze.setEnabled(False)
-        self.btn_analyze.setText("Fetching...")
+        self.btn_analyze.setText("A processar...")
         worker = proc.AnalysisWorker(url)
         worker.signals.result.connect(self.on_analysis_success)
         worker.signals.thumbnail_data.connect(self.on_thumbnail_ready)
         worker.signals.error.connect(self.on_analysis_error)
-        worker.signals.finished.connect(lambda: self.btn_analyze.setEnabled(True))
-        worker.signals.finished.connect(lambda: self.btn_analyze.setText("Analyze Media"))
+        worker.signals.finished.connect(lambda: self.btn_analyze.setEnabled(True) if not sip.isdeleted(self.btn_analyze) else None)
+        worker.signals.finished.connect(lambda: self.btn_analyze.setText("Analisar Multimédia") if not sip.isdeleted(self.btn_analyze) else None)
         self.thread_pool.start(worker)
 
     @pyqtSlot(object)
     def on_analysis_success(self, meta: proc.MediaMetadata) -> None:
+        if sip.isdeleted(self) or sip.isdeleted(self.inspector): return
         self._current_meta = meta
         self.inspector.set_metadata(meta)
-        self.inspector.setVisible(True)
-        self.action_bar.setVisible(True)
+        if not sip.isdeleted(self.inspector):
+            self.inspector.setVisible(True)
+        if not sip.isdeleted(self.action_bar):
+            self.action_bar.setVisible(True)
 
     @pyqtSlot(bytes)
     def on_thumbnail_ready(self, data: bytes) -> None:
+        if sip.isdeleted(self) or sip.isdeleted(self.inspector): return
         pixmap = QPixmap()
         pixmap.loadFromData(data)
         self.inspector.set_thumbnail(pixmap)
 
     @pyqtSlot(str)
     def on_analysis_error(self, err_msg: str) -> None:
-        QMessageBox.critical(self, "Analysis Failed", err_msg)
-        self.inspector.setVisible(False)
-        self.action_bar.setVisible(False)
+        if sip.isdeleted(self): return
+        QMessageBox.critical(self, "Falha na Análise", err_msg)
+        if not sip.isdeleted(self.inspector):
+            self.inspector.setVisible(False)
+        if not sip.isdeleted(self.action_bar):
+            self.action_bar.setVisible(False)
 
     def browse_folder(self) -> None:
-        d = QFileDialog.getExistingDirectory(self, "Save Location", self.path_input.text())
+        d = QFileDialog.getExistingDirectory(self, "Localização de Guarda", self.path_input.text())
         if d: self.path_input.setText(d)
 
     def open_output_folder(self) -> None:
@@ -1118,7 +1136,7 @@ class MainWindow(QMainWindow):
         btn_layout.setContentsMargins(0, 0, 0, 0)
         btn_container = QWidget()
         
-        btn_cancel = QPushButton("Stop")
+        btn_cancel = QPushButton("Parar")
         btn_cancel.setObjectName("Destructive")
         btn_cancel.clicked.connect(lambda _, jid=config.job_id: self.cancel_job(jid))
         
@@ -1127,7 +1145,7 @@ class MainWindow(QMainWindow):
         
         self.table.setItem(row, 0, title_item)
         self.table.setItem(row, 1, QTableWidgetItem(fmt_str))
-        self.table.setItem(row, 2, QTableWidgetItem("Queued"))
+        self.table.setItem(row, 2, QTableWidgetItem("Na Fila"))
         self.table.setCellWidget(row, 3, pbar)
         self.table.setCellWidget(row, 4, btn_container)
 
@@ -1160,15 +1178,17 @@ class MainWindow(QMainWindow):
                 item.setText(msg)
 
     def on_job_finished(self, job_id: str) -> None:
-        self._cleanup_job(job_id, "✔ Done", QColor("#4caf50"))
+        if sip.isdeleted(self): return
+        self._cleanup_job(job_id, "✔ Concluído", QColor("#4caf50"))
 
     def on_job_error(self, job_id: str, err: str) -> None:
-        self._cleanup_job(job_id, "✘ Error", QColor("#d32f2f"))
+        if sip.isdeleted(self): return
+        self._cleanup_job(job_id, "✘ Erro", QColor("#d32f2f"))
 
     def cancel_job(self, job_id: str) -> None:
         if job_id in self.active_runnables:
             self.active_runnables[job_id].cancel()
-            self._cleanup_job(job_id, "Cancelled", QColor("#ff9800"))
+            self._cleanup_job(job_id, "Cancelado", QColor("#ff9800"))
 
     def _cleanup_job(self, job_id: str, status_text: str, color: QColor) -> None:
         row = self.get_row_by_id(job_id)
@@ -1178,12 +1198,12 @@ class MainWindow(QMainWindow):
                 item.setText(status_text)
                 item.setForeground(color)
             
-            if "Done" in status_text: 
+            if "Concluído" in status_text: 
                 widget = self.table.cellWidget(row, 3)
                 if isinstance(widget, QProgressBar):
                     widget.setValue(100)
                 
-                btn_open = QPushButton("Open Folder")
+                btn_open = QPushButton("Abrir Pasta")
                 btn_open.clicked.connect(self.open_output_folder)
                 
                 layout = QHBoxLayout()
@@ -1193,13 +1213,13 @@ class MainWindow(QMainWindow):
                 container.setLayout(layout)
                 self.table.setCellWidget(row, 4, container)
                 
-            elif "Cancelled" in status_text:
+            elif "Cancelado" in status_text:
                 widget = self.table.cellWidget(row, 3)
                 if isinstance(widget, QProgressBar):
                     widget.setValue(0)
                 self.table.setCellWidget(row, 4, QWidget())
                 
-            elif "Error" in status_text:
+            elif "Erro" in status_text:
                 self.table.setCellWidget(row, 4, QWidget())
                 
         if job_id in self.active_runnables: 
@@ -1215,7 +1235,7 @@ class MainWindow(QMainWindow):
         event.accept()
 
 def handle_exception(exc_type: type[BaseException], exc_value: BaseException, exc_traceback: Optional[types.TracebackType]) -> None:
-    logging.critical("Uncaught Exception:", exc_info=(exc_type, exc_value, exc_traceback))
+    logging.critical("Exceção não tratada:", exc_info=(exc_type, exc_value, exc_traceback))
 
 def main() -> None:
     sys.excepthook = handle_exception
