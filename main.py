@@ -425,6 +425,7 @@ class MainWindow(QMainWindow):
 
     def _init_menu_bar(self) -> None:
         menu_bar = self.menuBar()
+        if menu_bar is None: return
         
         menu_file = menu_bar.addMenu("Arquivo")
         action_exit = QAction("Sair", self)
@@ -521,7 +522,8 @@ class MainWindow(QMainWindow):
         self.table.setHorizontalHeaderLabels(["Filename / Title", "Format", "Status", "Progress", "Actions"])
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         header_view = self.table.horizontalHeader()
-        header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        if header_view is not None:
+            header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_context_menu)
@@ -541,24 +543,26 @@ class MainWindow(QMainWindow):
         final_layout.setContentsMargins(0,0,0,0)
         final_layout.addWidget(main_splitter)
 
-    def _show_context_menu(self, pos):
+    def _show_context_menu(self, pos: Any) -> None:
         item = self.table.itemAt(pos)
         menu = QMenu(self)
         
-        if item:
+        if item is not None:
             row = item.row()
-            job_id = self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
-            
-            action_remove = QAction("Remove from Queue", self)
-            action_remove.triggered.connect(lambda: self._remove_from_queue(job_id))
-            menu.addAction(action_remove)
-            
-            if job_id in self.active_runnables:
-                action_cancel = QAction("Cancel Download (Instant)", self)
-                action_cancel.triggered.connect(lambda: self.cancel_job(job_id))
-                menu.addAction(action_cancel)
+            cell_item = self.table.item(row, 0)
+            if cell_item is not None:
+                job_id = cell_item.data(Qt.ItemDataRole.UserRole)
                 
-            menu.addSeparator()
+                action_remove = QAction("Remove from Queue", self)
+                action_remove.triggered.connect(lambda _, jid=job_id: self._remove_from_queue(jid))
+                menu.addAction(action_remove)
+                
+                if job_id in self.active_runnables:
+                    action_cancel = QAction("Cancel Download (Instant)", self)
+                    action_cancel.triggered.connect(lambda _, jid=job_id: self.cancel_job(jid))
+                    menu.addAction(action_cancel)
+                    
+                menu.addSeparator()
             
         action_open = QAction("Open Output Folder", self)
         action_open.triggered.connect(self.open_output_folder)
@@ -568,9 +572,11 @@ class MainWindow(QMainWindow):
         action_clear.triggered.connect(self._clear_finished_jobs)
         menu.addAction(action_clear)
         
-        menu.exec(self.table.viewport().mapToGlobal(pos))
+        viewport = self.table.viewport()
+        if viewport is not None:
+            menu.exec(viewport.mapToGlobal(pos))
 
-    def _remove_from_queue(self, job_id: str):
+    def _remove_from_queue(self, job_id: str) -> None:
         if job_id in self.active_runnables:
             self.active_runnables[job_id].cancel()
             del self.active_runnables[job_id]
@@ -707,7 +713,7 @@ class MainWindow(QMainWindow):
         
         btn_cancel = QPushButton("Stop")
         btn_cancel.setObjectName("Destructive")
-        btn_cancel.clicked.connect(lambda: self.cancel_job(config.job_id))
+        btn_cancel.clicked.connect(lambda _, jid=config.job_id: self.cancel_job(jid))
         
         btn_layout.addWidget(btn_cancel)
         btn_container.setLayout(btn_layout)
@@ -779,11 +785,13 @@ class MainWindow(QMainWindow):
                 self.table.setCellWidget(row, 4, container)
                 
             elif "Cancelled" in status_text:
-                self.table.cellWidget(row, 3).setValue(0)
-                self.table.setCellWidget(row, 4, None)
+                widget = self.table.cellWidget(row, 3)
+                if isinstance(widget, QProgressBar):
+                    widget.setValue(0)
+                self.table.setCellWidget(row, 4, QWidget())
                 
             elif "Error" in status_text:
-                self.table.setCellWidget(row, 4, None)
+                self.table.setCellWidget(row, 4, QWidget())
                 
         if job_id in self.active_runnables: 
             del self.active_runnables[job_id]
