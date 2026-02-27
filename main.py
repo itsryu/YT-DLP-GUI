@@ -511,7 +511,7 @@ class MainWindow(QMainWindow):
         
         self.thread_pool = QThreadPool.globalInstance()
         self.thread_pool.setMaxThreadCount(MAX_CONCURRENT_DOWNLOADS)
-        self.active_runnables: Dict[str, proc.DownloadRunnable] = {}
+        self.active_runnables: Dict[str, proc.DownloadWorker] = {}
         self._current_meta: Optional[proc.MediaMetadata] = None
         
         self.qt_log_handler = QtLogHandler()
@@ -703,7 +703,7 @@ class MainWindow(QMainWindow):
         
         self.btn_analyze.setEnabled(False)
         self.btn_analyze.setText("Fetching...")
-        worker = proc.AnalysisRunnable(url)
+        worker = proc.AnalysisWorker(url)
         worker.signals.result.connect(self.on_analysis_success)
         worker.signals.thumbnail_data.connect(self.on_thumbnail_ready)
         worker.signals.error.connect(self.on_analysis_error)
