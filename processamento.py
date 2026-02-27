@@ -34,6 +34,7 @@ class MediaMetadata:
     description: str
     channel: str
 
+
 @dataclass(frozen=True)
 class DownloadJobConfig:
     job_id: str

@@ -2,7 +2,8 @@ import sys
 import logging
 import uuid
 import re
-from typing import Final, Dict, Any, Optional
+import types
+from typing import Final, Dict, Any, Optional, cast
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
@@ -65,100 +66,51 @@ class ThemeManager:
     @staticmethod
     def get_stylesheet(is_dark: bool) -> str:
         qss = """
-        QWidget { font-family: 'Segoe UI', 'Roboto', sans-serif; font-size: 13px; }
-        
-        QFrame#Panel {
-            border-radius: 8px;
-            border: 1px solid UID_BORDER;
-            background-color: UID_PANEL_BG;
-        }
-        
-        QPushButton#PrimaryAction {
-            background-color: #007acc;
-            color: white;
-            border-radius: 4px;
-            padding: 8px 16px;
-            font-weight: bold;
-            border: none;
-        }
-        QPushButton#PrimaryAction:hover { background-color: #0062a3; }
-        QPushButton#PrimaryAction:disabled { background-color: UID_DISABLED_BG; color: UID_DISABLED_TXT; }
-        
-        QPushButton#Destructive {
-            color: #d32f2f;
-            border: 1px solid #d32f2f;
-            border-radius: 4px;
-            padding: 4px 8px;
-            background-color: transparent;
-        }
-        QPushButton#Destructive:hover { background-color: rgba(211, 47, 47, 0.1); }
-        
-        QLabel#MainHeader { color: #007acc; font-size: 24px; font-weight: 800; letter-spacing: 2px; }
-        QLabel#ThumbLabel { background-color: UID_THUMB_BG; border: 1px solid UID_BORDER; color: UID_THUMB_TEXT; }
-        QLabel#StatsLabel, QLabel#LogHeader { color: UID_THUMB_TEXT; }
-        QLabel#LogHeader { font-weight: bold; font-size: 10px; letter-spacing: 1px; }
-        
-        QPlainTextEdit#LogConsole {
-            background-color: UID_CONSOLE_BG;
-            color: UID_CONSOLE_TEXT;
-            font-family: 'Consolas', 'Courier New', monospace;
-            font-size: 11px;
-            border: 1px solid UID_BORDER;
-            border-radius: 4px;
-        }
-        
-        QMenu { background-color: UID_PANEL_BG; border: 1px solid UID_BORDER; padding: 5px; }
-        QMenu::item { padding: 6px 20px 6px 20px; border-radius: 4px; }
-        QMenu::item:selected { background-color: #007acc; color: white; }
-        QMenu::separator { height: 1px; background: UID_BORDER; margin: 4px 10px; }
+            QWidget { font-family: 'Segoe UI', 'Roboto', sans-serif; font-size: 13px; }
+            QFrame#Panel { border-radius: 8px; border: 1px solid UID_BORDER; background-color: UID_PANEL_BG; }
+            QPushButton#PrimaryAction { background-color: #007acc; color: white; border-radius: 4px; padding: 8px 16px; font-weight: bold; border: none; }
+            QPushButton#PrimaryAction:hover { background-color: #0062a3; }
+            QPushButton#PrimaryAction:disabled { background-color: UID_DISABLED_BG; color: UID_DISABLED_TXT; }
+            QPushButton#Destructive { color: #d32f2f; border: 1px solid #d32f2f; border-radius: 4px; padding: 4px 8px; background-color: transparent; }
+            QPushButton#Destructive:hover { background-color: rgba(211, 47, 47, 0.1); }
+            QLabel#MainHeader { color: #007acc; font-size: 24px; font-weight: 800; letter-spacing: 2px; }
+            QLabel#ThumbLabel { background-color: UID_THUMB_BG; border: 1px solid UID_BORDER; color: UID_THUMB_TEXT; }
+            QLabel#StatsLabel, QLabel#LogHeader { color: UID_THUMB_TEXT; }
+            QLabel#LogHeader { font-weight: bold; font-size: 10px; letter-spacing: 1px; }
+            QPlainTextEdit#LogConsole { background-color: UID_CONSOLE_BG; color: UID_CONSOLE_TEXT; font-family: 'Consolas', 'Courier New', monospace; font-size: 11px; border: 1px solid UID_BORDER; border-radius: 4px; }
+            QMenu { background-color: UID_PANEL_BG; border: 1px solid UID_BORDER; padding: 5px; }
+            QMenu::item { padding: 6px 20px 6px 20px; border-radius: 4px; }
+            QMenu::item:selected { background-color: #007acc; color: white; }
+            QMenu::separator { height: 1px; background: UID_BORDER; margin: 4px 10px; }
         """
         if is_dark:
-            qss = qss.replace("UID_BORDER", "#3d3d3d")
-            qss = qss.replace("UID_PANEL_BG", "#1e1e1e")
-            qss = qss.replace("UID_THUMB_BG", "#000000")
-            qss = qss.replace("UID_THUMB_TEXT", "#aaaaaa")
-            qss = qss.replace("UID_CONSOLE_BG", "#0e0e0e")
-            qss = qss.replace("UID_CONSOLE_TEXT", "#d4d4d4")
-            qss = qss.replace("UID_DISABLED_BG", "#333333")
-            qss = qss.replace("UID_DISABLED_TXT", "#777777")
-        else:
-            qss = qss.replace("UID_BORDER", "#cccccc")
-            qss = qss.replace("UID_PANEL_BG", "#ffffff")
-            qss = qss.replace("UID_THUMB_BG", "#eaeaea")
-            qss = qss.replace("UID_THUMB_TEXT", "#666666")
-            qss = qss.replace("UID_CONSOLE_BG", "#ffffff")
-            qss = qss.replace("UID_CONSOLE_TEXT", "#333333")
-            qss = qss.replace("UID_DISABLED_BG", "#e0e0e0")
-            qss = qss.replace("UID_DISABLED_TXT", "#999999")
-            
-        return qss
-
+            return qss.replace("UID_BORDER", "#3d3d3d").replace("UID_PANEL_BG", "#1e1e1e").replace("UID_THUMB_BG", "#000000").replace("UID_THUMB_TEXT", "#aaaaaa").replace("UID_CONSOLE_BG", "#0e0e0e").replace("UID_CONSOLE_TEXT", "#d4d4d4").replace("UID_DISABLED_BG", "#333333").replace("UID_DISABLED_TXT", "#777777")
+        return qss.replace("UID_BORDER", "#cccccc").replace("UID_PANEL_BG", "#ffffff").replace("UID_THUMB_BG", "#eaeaea").replace("UID_THUMB_TEXT", "#666666").replace("UID_CONSOLE_BG", "#ffffff").replace("UID_CONSOLE_TEXT", "#333333").replace("UID_DISABLED_BG", "#e0e0e0").replace("UID_DISABLED_TXT", "#999999")
 
 class QtLogHandler(logging.Handler, QObject):
     log_record = pyqtSignal(str, int)
 
-    def __init__(self):
+    def __init__(self) -> None:
         logging.Handler.__init__(self)
         QObject.__init__(self)
         self.setFormatter(logging.Formatter('[%(asctime)s] %(name)s: %(message)s', datefmt='%H:%M:%S'))
 
-    def emit(self, record: logging.LogRecord):
+    def emit(self, record: logging.LogRecord) -> None:
         msg = self.format(record)
         self.log_record.emit(msg, record.levelno)
 
-
 class LogViewerWidget(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self._init_ui()
         self.fmt_debug = QTextCharFormat()
         self.fmt_info = QTextCharFormat()
         self.fmt_warning = QTextCharFormat()
         self.fmt_error = QTextCharFormat()
         self.fmt_critical = QTextCharFormat()
         self.fmt_critical.setFontWeight(QFont.Weight.Bold)
+        self._init_ui()
 
-    def _init_ui(self):
+    def _init_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         
@@ -182,7 +134,7 @@ class LogViewerWidget(QWidget):
         layout.addLayout(header_layout)
         layout.addWidget(self.text_edit)
 
-    def update_theme_colors(self, is_dark: bool):
+    def update_theme_colors(self, is_dark: bool) -> None:
         if is_dark:
             self.fmt_debug.setForeground(QColor("#808080"))
             self.fmt_info.setForeground(QColor("#569cd6"))
@@ -197,7 +149,7 @@ class LogViewerWidget(QWidget):
             self.fmt_critical.setForeground(QColor("#b71c1c"))
 
     @pyqtSlot(str, int)
-    def append_log(self, msg: str, levelno: int):
+    def append_log(self, msg: str, levelno: int) -> None:
         cursor = self.text_edit.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         if levelno >= logging.CRITICAL: cursor.setCharFormat(self.fmt_critical)
@@ -209,18 +161,17 @@ class LogViewerWidget(QWidget):
         self.text_edit.setTextCursor(cursor)
         self.text_edit.ensureCursorVisible()
 
-    def clear_logs(self):
+    def clear_logs(self) -> None:
         self.text_edit.clear()
 
-
 class InspectorPanel(QFrame):
-    def __init__(self, parent=None):
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setObjectName("Panel")
         self._current_meta: Optional[proc.MediaMetadata] = None
         self._init_ui()
 
-    def _init_ui(self):
+    def _init_ui(self) -> None:
         main_layout = QHBoxLayout(self)
         main_layout.setContentsMargins(20, 20, 20, 20)
         main_layout.setSpacing(20)
@@ -386,10 +337,10 @@ class InspectorPanel(QFrame):
         self.in_genre.clear()
         self._recalc_estimate()
 
-    def set_thumbnail(self, pixmap: QPixmap):
+    def set_thumbnail(self, pixmap: QPixmap) -> None:
         self.thumb_lbl.setPixmap(pixmap)
 
-    def _update_ui_mode(self):
+    def _update_ui_mode(self) -> None:
         is_video = self.rb_video.isChecked()
         
         self.cb_container.blockSignals(True)
@@ -453,9 +404,8 @@ class InspectorPanel(QFrame):
             'use_cookies': self.chk_cookies.isChecked(),
         }
 
-
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} {VERSION}")
         self.resize(1200, 900)
@@ -508,7 +458,7 @@ class MainWindow(QMainWindow):
     def _show_about_dialog(self) -> None:
         QMessageBox.about(self, "Sobre", f"{APP_NAME} {VERSION}\n\nInterface construída via PyQt6 com arquitetura orientada a eventos.")
 
-    def init_ui(self):
+    def init_ui(self) -> None:
         central = QWidget()
         self.setCentralWidget(central)
         
@@ -629,17 +579,17 @@ class MainWindow(QMainWindow):
         if row >= 0:
             self.table.removeRow(row)
 
-    def _clear_finished_jobs(self):
+    def _clear_finished_jobs(self) -> None:
         for row in range(self.table.rowCount() - 1, -1, -1):
             status_item = self.table.item(row, 2)
-            if status_item and status_item.text() in ["✔ Done", "✘ Error", "Cancelled"]:
+            if status_item is not None and status_item.text() in ["✔ Done", "✘ Error", "Cancelled"]:
                 self.table.removeRow(row)
 
-    def toggle_dev_mode(self, checked: bool):
+    def toggle_dev_mode(self, checked: bool) -> None:
         logging.getLogger().setLevel(logging.DEBUG if checked else logging.INFO)
         self.log_viewer.setVisible(checked)
 
-    def start_analysis(self):
+    def start_analysis(self) -> None:
         url = self.url_input.text().strip()
         if not url: return
         
@@ -658,29 +608,29 @@ class MainWindow(QMainWindow):
         self.thread_pool.start(worker)
 
     @pyqtSlot(object)
-    def on_analysis_success(self, meta: proc.MediaMetadata):
+    def on_analysis_success(self, meta: proc.MediaMetadata) -> None:
         self._current_meta = meta
         self.inspector.set_metadata(meta)
         self.inspector.setVisible(True)
         self.action_bar.setVisible(True)
 
     @pyqtSlot(bytes)
-    def on_thumbnail_ready(self, data: bytes):
+    def on_thumbnail_ready(self, data: bytes) -> None:
         pixmap = QPixmap()
         pixmap.loadFromData(data)
         self.inspector.set_thumbnail(pixmap)
 
     @pyqtSlot(str)
-    def on_analysis_error(self, err_msg: str):
+    def on_analysis_error(self, err_msg: str) -> None:
         QMessageBox.critical(self, "Analysis Failed", err_msg)
         self.inspector.setVisible(False)
         self.action_bar.setVisible(False)
 
-    def browse_folder(self):
+    def browse_folder(self) -> None:
         d = QFileDialog.getExistingDirectory(self, "Save Location", self.path_input.text())
         if d: self.path_input.setText(d)
 
-    def open_output_folder(self):
+    def open_output_folder(self) -> None:
         path_str = self.path_input.text()
         if path_str:
             path_obj = Path(path_str)
@@ -689,7 +639,7 @@ class MainWindow(QMainWindow):
             else:
                 QMessageBox.warning(self, "Warning", "The specified directory does not exist or cannot be accessed.")
 
-    def queue_download(self):
+    def queue_download(self) -> None:
         if not self._current_meta: return
         data = self.inspector.get_config_delta()
         
@@ -735,7 +685,7 @@ class MainWindow(QMainWindow):
         self.add_table_row(config)
         self.thread_pool.start(runnable)
 
-    def add_table_row(self, config: proc.DownloadJobConfig):
+    def add_table_row(self, config: proc.DownloadJobConfig) -> None:
         row = self.table.rowCount()
         self.table.insertRow(row)
         
@@ -771,41 +721,53 @@ class MainWindow(QMainWindow):
     def get_row_by_id(self, job_id: str) -> int:
         for r in range(self.table.rowCount()):
             item = self.table.item(r, 0)
-            if item and item.data(Qt.ItemDataRole.UserRole) == job_id: return r
+            if item is not None and item.data(Qt.ItemDataRole.UserRole) == job_id: return r
         return -1
 
     @pyqtSlot(str, float, str)
-    def update_progress(self, job_id: str, pct: float, speed: str):
+    def update_progress(self, job_id: str, pct: float, speed: str) -> None:
         row = self.get_row_by_id(job_id)
         if row >= 0:
-            self.table.cellWidget(row, 3).setValue(int(pct))
-            self.table.item(row, 2).setText(f"▼ {speed}")
+            widget = self.table.cellWidget(row, 3)
+            if isinstance(widget, QProgressBar):
+                widget.setValue(int(pct))
+            
+            item = self.table.item(row, 2)
+            if item is not None:
+                item.setText(f"▼ {speed}")
 
     @pyqtSlot(str, str)
-    def update_status(self, job_id: str, msg: str):
+    def update_status(self, job_id: str, msg: str) -> None:
         row = self.get_row_by_id(job_id)
-        if row >= 0: self.table.item(row, 2).setText(msg)
+        if row >= 0:
+            item = self.table.item(row, 2)
+            if item is not None:
+                item.setText(msg)
 
-    def on_job_finished(self, job_id: str):
+    def on_job_finished(self, job_id: str) -> None:
         self._cleanup_job(job_id, "✔ Done", QColor("#4caf50"))
 
-    def on_job_error(self, job_id: str, err: str):
+    def on_job_error(self, job_id: str, err: str) -> None:
         self._cleanup_job(job_id, "✘ Error", QColor("#d32f2f"))
 
-    def cancel_job(self, job_id: str):
+    def cancel_job(self, job_id: str) -> None:
         if job_id in self.active_runnables:
             self.active_runnables[job_id].cancel()
             self._cleanup_job(job_id, "Cancelled", QColor("#ff9800"))
 
-    def _cleanup_job(self, job_id: str, status_text: str, color: QColor):
+    def _cleanup_job(self, job_id: str, status_text: str, color: QColor) -> None:
         row = self.get_row_by_id(job_id)
         if row >= 0:
             item = self.table.item(row, 2)
-            item.setText(status_text)
-            item.setForeground(color)
+            if item is not None:
+                item.setText(status_text)
+                item.setForeground(color)
             
             if "Done" in status_text: 
-                self.table.cellWidget(row, 3).setValue(100)
+                widget = self.table.cellWidget(row, 3)
+                if isinstance(widget, QProgressBar):
+                    widget.setValue(100)
+                
                 btn_open = QPushButton("Open Folder")
                 btn_open.clicked.connect(self.open_output_folder)
                 
@@ -835,8 +797,11 @@ class MainWindow(QMainWindow):
         self.thread_pool.clear()
         event.accept()
 
-def main():
-    sys.excepthook = lambda t, v, tb: logging.critical("Uncaught Exception:", exc_info=(t, v, tb))
+def handle_exception(exc_type: type[BaseException], exc_value: BaseException, exc_traceback: Optional[types.TracebackType]) -> None:
+    logging.critical("Uncaught Exception:", exc_info=(exc_type, exc_value, exc_traceback))
+
+def main() -> None:
+    sys.excepthook = handle_exception
     logging.basicConfig(level=logging.INFO)
     
     app = QApplication(sys.argv)
