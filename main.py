@@ -25,7 +25,6 @@ from PyQt6.QtCore import Qt, QObject, pyqtSignal, QThreadPool, pyqtSlot, QUrl, Q
 from PyQt6.QtGui import QColor, QPixmap, QFont, QTextCursor, QTextCharFormat, QDesktopServices, QPalette, QAction, QCloseEvent, QImage
 from PyQt6 import sip
 
-# Pressupõe-se a existência do módulo de processamento no ambiente
 import processamento as proc
 
 APP_NAME: Final[str] = "SoundStream Pro"
@@ -179,7 +178,7 @@ class MetadataCandidate:
     album: str
     date: str
     genre: str
-    release_id: str  # MBID necessário para o Cover Art Archive
+    release_id: str
 
 class MusicBrainzSignals(QObject):
     results_ready = pyqtSignal(list)
@@ -201,7 +200,6 @@ class MusicBrainzWorker(QRunnable):
         self.signals = MusicBrainzSignals()
 
     def _escape_lucene(self, text: str) -> str:
-        """Limpa a string para compatibilidade com a sintaxe de pesquisa Lucene."""
         return re.sub(r'([+\-!(){}\[\]^"~*?:\\])', r'\\\1', text)
 
     @pyqtSlot()
@@ -215,7 +213,6 @@ class MusicBrainzWorker(QRunnable):
             if self.album_query:
                 query_parts.append(f'release:"{self._escape_lucene(self.album_query)}"')
             if self.date_query:
-                # O MusicBrainz aceita anos (YYYY) no campo date da entidade recording
                 query_parts.append(f'date:"{self._escape_lucene(self.date_query)}"')
             
             if not query_parts:
@@ -263,7 +260,6 @@ class MusicBrainzWorker(QRunnable):
                 album = releases[0].get("title", "") if releases else ""
                 date = releases[0].get("date", "")[:4] if releases and releases[0].get("date") else ""
                 
-                # Resolução do identificador universal (MBID) para interoperabilidade com CAA
                 release_id = releases[0].get("id", "") if releases else ""
                 
                 tags = rec.get("tags", [])
@@ -277,10 +273,6 @@ class MusicBrainzWorker(QRunnable):
             self.signals.error.emit(str(e))
 
 class CoverArtWorker(QRunnable):
-    """
-    Worker especializado na obtenção de arte de capa na resolução original.
-    Implementa resiliência TLS via Connection:close e retentativas com Exponential Backoff.
-    """
     def __init__(self, release_id: str) -> None:
         super().__init__()
         self.release_id = release_id
@@ -292,7 +284,6 @@ class CoverArtWorker(QRunnable):
             self.signals.error.emit("Sem MBID de Release.")
             return
 
-        # O endpoint /front redireciona para a imagem original (máxima qualidade)
         url = f"https://coverartarchive.org/release/{self.release_id}/front"
         headers = {
             "User-Agent": f"{APP_NAME}/{VERSION} ( dev@localhost )",
@@ -314,7 +305,6 @@ class CoverArtWorker(QRunnable):
                 if attempt == max_retries - 1:
                     self.signals.error.emit(f"Falha persistente na camada SSL/TLS: {str(e)}")
                     return
-                # Recuo exponencial para mitigar rate-limiting ou instabilidade de handshake
                 time.sleep(2 ** attempt)
 
         if not buffer:
@@ -389,7 +379,6 @@ class InspectorPanel(QFrame):
         main_layout.setContentsMargins(20, 20, 20, 20)
         main_layout.setSpacing(20)
 
-        # Ancora rigorosa das instâncias ao escopo da QFrame (self)
         left_col = QWidget(self)
         left_layout = QVBoxLayout(left_col)
         
@@ -429,7 +418,6 @@ class InspectorPanel(QFrame):
         
         self.tabs = QTabWidget(right_container)
         
-        # --- TAB FORMATO ---
         tab_format = QWidget(self.tabs)
         fmt_layout = QVBoxLayout(tab_format)
         fmt_grid = QGridLayout()
@@ -490,7 +478,6 @@ class InspectorPanel(QFrame):
         fmt_layout.addLayout(fmt_grid)
         fmt_layout.addStretch()
         
-        # --- TAB METADATA ---
         tab_meta = QWidget(self.tabs)
         meta_scroll = QScrollArea(tab_meta)
         meta_scroll.setWidgetResizable(True)
@@ -524,7 +511,6 @@ class InspectorPanel(QFrame):
         meta_layout = QVBoxLayout(tab_meta)
         meta_layout.addWidget(meta_scroll)
 
-        # --- TAB AVANÇADA ---
         tab_adv = QWidget(self.tabs)
         adv_layout = QVBoxLayout(tab_adv)
         
@@ -550,7 +536,6 @@ class InspectorPanel(QFrame):
         
         tmpl_layout = QHBoxLayout()
         tmpl_layout.setContentsMargins(0, 0, 0, 0)
-        # Template atualizado para Música - Artista conforme solicitado
         self.in_output_tmpl = QLineEdit("%(title)s - %(artist)s.%(ext)s", dev_group)
         
         btn_tmpl_help = QPushButton("?", dev_group)
@@ -579,7 +564,6 @@ class InspectorPanel(QFrame):
         adv_layout.addWidget(dev_group)
         adv_layout.addStretch()
 
-        # Acoplar Tabs
         self.tabs.addTab(tab_format, "Formato e Qualidade")
         self.tabs.addTab(tab_meta, "Metadados e Ficheiro")
         self.tabs.addTab(tab_adv, "Configuração Avançada")
@@ -630,7 +614,6 @@ class InspectorPanel(QFrame):
             if cand.date and not sip.isdeleted(self.in_date): self.in_date.setText(cand.date)
             if cand.genre and not sip.isdeleted(self.in_genre): self.in_genre.setText(cand.genre)
             
-            # Transferência da arte original com lógica de resiliência SSL
             if cand.release_id:
                 self.btn_fetch_mb.setText("A transferir arte HD...")
                 self.btn_fetch_mb.setEnabled(False)
@@ -652,10 +635,6 @@ class InspectorPanel(QFrame):
 
     @pyqtSlot(str)
     def _on_cover_art_error(self, err_msg: str) -> None:
-        """
-        Garante que, em caso de erro na obtenção da arte HD, a miniatura 
-        original do vídeo seja preservada sem alterações.
-        """
         if sip.isdeleted(self) or sip.isdeleted(self.btn_fetch_mb): return
         self.btn_fetch_mb.setEnabled(True)
         self.btn_fetch_mb.setText("Preenchimento Automático (MusicBrainz)")
@@ -701,7 +680,6 @@ class InspectorPanel(QFrame):
         if sip.isdeleted(self) or sip.isdeleted(self.in_filename): return
         self._current_meta = meta
         
-        # Sanitização agressiva para evitar Errno 22 (caracteres ilegais no Windows)
         sanitized_title = re.sub(r'[\x00-\x1f\x7f]', '', meta.title)
         sanitized_title = re.sub(r'[<>:"/\\|?*]', '', sanitized_title)
         sanitized_title = re.sub(r'\s+', ' ', sanitized_title).strip()
@@ -768,10 +746,6 @@ class InspectorPanel(QFrame):
         self.stats_lbl.setText(base_info)
 
     def get_config_delta(self) -> Dict[str, Any]:
-        """
-        Extrai as configurações atuais da interface de forma thread-safe.
-        Verifica se os objetos subjacentes em C++ ainda existem para evitar RuntimeErrors.
-        """
         if sip.isdeleted(self) or sip.isdeleted(self.tabs):
             return {}
 
@@ -898,7 +872,6 @@ class MainWindow(QMainWindow):
         input_layout.addWidget(self.btn_analyze)
         main_layout.addWidget(input_frame)
 
-        # Injeção explícita de parentalidade na criação do Panel
         self.inspector = InspectorPanel(top_container)
         self.inspector.setVisible(False)
         main_layout.addWidget(self.inspector)
@@ -1061,7 +1034,6 @@ class MainWindow(QMainWindow):
     def queue_download(self) -> None:
         if not self._current_meta: return
         
-        # Extração de dados com validação de ponteiros sip
         data = self.inspector.get_config_delta()
         if not data:
             return
