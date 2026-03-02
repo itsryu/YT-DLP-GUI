@@ -2,3 +2,4 @@ PyQt6
 yt_dlp
 mutagen
 requests
+aiohttp

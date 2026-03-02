@@ -3,20 +3,20 @@ import shutil
 import re
 import shlex
 import subprocess
+import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
 from typing import Optional, Any, TypedDict, Dict, List, cast
 import threading
-from concurrent.futures import ThreadPoolExecutor
 
 try:
     import yt_dlp  # type: ignore
     from yt_dlp.utils import DownloadError  # type: ignore
-    import requests
+    import aiohttp
 except ImportError as e:
-    raise ImportError(f"CRITICAL: Missing dependency. {e}. Please run 'pip install yt-dlp requests'")
+    raise ImportError(f"CRITICAL: Missing dependency. {e}. Please run 'pip install yt-dlp aiohttp'")
 
 from PyQt6.QtCore import QObject, pyqtSignal, QRunnable, pyqtSlot
 
