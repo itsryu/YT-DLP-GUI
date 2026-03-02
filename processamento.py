@@ -380,19 +380,13 @@ class DownloadWorker(QRunnable):
             'progress_hooks': [self._progress_hook],
             'quiet': True,
             'no_warnings': True,
-            'ignoreerrors': True,
+            'ignoreerrors': False,  # Aplicação estrita do padrão Fail-Fast (encerra e avisa erros de FFmpeg)
             'retries': 10,
             'fragment_retries': 10,
             'socket_timeout': 10,
             'logger': YtDlpInterceptorLogger(self.config.job_id, self._check_abort),
             'postprocessors': [],
             'postprocessor_args': {},
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['android', 'web'],
-                    'player_skip': ['web_safari', 'web_cabr']
-                }
-            }
         }
 
         if self.config.ffmpeg_path:
@@ -410,26 +404,57 @@ class DownloadWorker(QRunnable):
     def _configure_format_opts(self, opts: dict[str, Any]) -> None:
         if self.config.media_type == MediaType.AUDIO:
             opts['format'] = 'bestaudio/best'
-            
-        elif self.config.media_type == MediaType.VIDEO:
-            res_map = {"4K": 2160, "2K": 1440, "1080p": 1080, "720p": 720, "480p": 480}
-            match = re.search(r'(\d+)p', self.config.quality_preset)
-            target_h = int(match.group(1)) if match else res_map.get(self.config.quality_preset)
-            
-            res_filter = f"[height<={target_h}]" if target_h else ""
-            
-            v_fmt = f"bestvideo{res_filter}"
-            if self.config.video_codec != 'best':
-                v_codec_map = {'h264': 'avc', 'vp9': 'vp9', 'av1': 'av01'}
-                vc = v_codec_map.get(self.config.video_codec, self.config.video_codec)
-                v_fmt += f"[vcodec^={vc}]"
-            
-            a_fmt = "bestaudio"
-            if self.config.audio_codec != 'best':
-                a_fmt = f"bestaudio[acodec^={self.config.audio_codec}]"
+            return
 
-            opts['format'] = f"{v_fmt}+{a_fmt}/best{res_filter}"
+        preset = self.config.quality_preset.lower()
+        target_h: Optional[int] = None
+        
+        is_best_req = any(kw in preset for kw in ['melhor', 'best', 'source', 'original'])
+        
+        if not is_best_req:
+            res_map = {"4k": 2160, "2k": 1440, "1080p": 1080, "720p": 720, "480p": 480}
+            match = re.search(r'(\d+)p', preset)
+            target_h = int(match.group(1)) if match else res_map.get(preset)
+
+        res_filter = f"[height<={target_h}]" if target_h is not None else ""
+        
+        opts['format'] = f"bestvideo{res_filter}+bestaudio/best{res_filter}"
+        
+        sort_opts: List[str] = ['res', 'fps']
+        v_codec = self.config.video_codec.lower()
+        
+        is_legacy = v_codec in ['divx', 'xvid'] or self.config.format_container == 'avi'
+        
+        if not is_legacy:
             opts['merge_output_format'] = self.config.format_container
+            
+            if 'melhor' not in v_codec and 'best' not in v_codec:
+                v_codec_map = {'h264': 'avc', 'vp9': 'vp9', 'av1': 'av01'}
+                vc = v_codec_map.get(v_codec, v_codec)
+                sort_opts.append(f"vcodec:{vc}")
+                
+            a_codec = self.config.audio_codec.lower()
+            if 'melhor' not in a_codec and 'best' not in a_codec:
+                sort_opts.append(f"acodec:{a_codec}")
+        else:
+            opts['merge_output_format'] = 'mkv'
+            
+            opts['postprocessors'].append({
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': self.config.format_container if self.config.format_container == 'avi' else 'mkv',
+            })
+            
+            pp_args = []
+            if v_codec == 'divx':
+                pp_args.extend(['-c:v', 'mpeg4', '-vtag', 'DIVX', '-qscale:v', '3'])
+            elif v_codec == 'xvid':
+                pp_args.extend(['-c:v', 'libxvid', '-qscale:v', '3'])
+                
+            pp_args.extend(['-c:a', 'libmp3lame', '-b:a', '192k', '-ar', '44100'])
+            
+            opts.setdefault('postprocessor_args', {}).setdefault('FFmpegVideoConvertor', []).extend(pp_args)
+
+        opts['format_sort'] = sort_opts
 
     def _configure_metadata_opts(self, opts: dict[str, Any]) -> None:
         if self.config.media_type == MediaType.AUDIO:
