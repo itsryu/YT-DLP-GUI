@@ -145,7 +145,12 @@ class YtDlpService:
         return bool(YtDlpService.URL_REGEX.match(url))
 
     @classmethod
-    def extract_info(cls, url: str) -> YtDlpExtractedInfo:
+    async def extract_info_async(cls, url: str) -> YtDlpExtractedInfo:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, cls._extract_info_sync, url)
+
+    @classmethod
+    def _extract_info_sync(cls, url: str) -> YtDlpExtractedInfo:
         logging.debug(f"Aguardando liberação de semáforo para extração de topologia: {url}")
         with cls._network_semaphore:
             ydl_opts: Dict[str, Any] = {
@@ -154,7 +159,6 @@ class YtDlpService:
                 'extract_flat': False,
                 'socket_timeout': 10,
                 'logger': logging.getLogger('yt_dlp_internal'),
-                'extractor_args': {'youtube': {'player_client': ['android', 'web']}}
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -163,15 +167,15 @@ class YtDlpService:
                 return cast(YtDlpExtractedInfo, info)
 
     @classmethod
-    def fetch_thumbnail_bytes(cls, url: str) -> Optional[bytes]:
-        with cls._network_semaphore:
-            try:
-                with requests.get(url, stream=True, timeout=10) as r:
-                    r.raise_for_status()
-                    return r.content
-            except requests.RequestException as e:
-                logging.error(f"Falha ao adquirir fluxo de miniatura: {e}")
-                return None
+    async def fetch_thumbnail_bytes_async(cls, url: str) -> Optional[bytes]:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=10) as response:
+                    response.raise_for_status()
+                    return await response.read()
+        except aiohttp.ClientError as e:
+            logging.error(f"Falha ao adquirir fluxo de miniatura via protocolo assíncrono: {e}")
+            return None
 
 
 class YtDlpInterceptorLogger:
