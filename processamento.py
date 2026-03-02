@@ -215,7 +215,7 @@ class SubprocessDSPEngine:
         
         cover_path = None
         if config.embed_thumbnail and info_dict.get('thumbnail'):
-            thumb_bytes = YtDlpService.fetch_thumbnail_bytes(info_dict['thumbnail'])
+            thumb_bytes = asyncio.run(YtDlpService.fetch_thumbnail_bytes_async(info_dict['thumbnail']))
             if thumb_bytes:
                 cover_path = temp_dir / "cover_art.jpg"
                 cover_path.write_bytes(thumb_bytes)
@@ -297,8 +297,11 @@ class AnalysisWorker(QRunnable):
 
     @pyqtSlot()
     def run(self) -> None:
+        asyncio.run(self._async_run())
+
+    async def _async_run(self) -> None:
         try:
-            info = YtDlpService.extract_info(self.url)
+            info = await YtDlpService.extract_info_async(self.url)
             
             meta = MediaMetadata(
                 title=info.get('title', 'Unknown'),
@@ -318,7 +321,7 @@ class AnalysisWorker(QRunnable):
             self.broker.emit_result(meta)
 
             if meta.thumbnail_url:
-                data = YtDlpService.fetch_thumbnail_bytes(meta.thumbnail_url)
+                data = await YtDlpService.fetch_thumbnail_bytes_async(meta.thumbnail_url)
                 if data:
                     self.broker.emit_thumbnail(data)
                     
