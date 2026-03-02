@@ -447,7 +447,7 @@ class InspectorPanel(QFrame):
         ])
         
         self.cb_vcodec = QComboBox(tab_format)
-        self.cb_vcodec.addItems(["Melhor", "H264", "VP9", "AV1"])
+        self.cb_vcodec.addItems(["Melhor", "H264", "VP9", "AV1", "DivX", "XviD"])
         
         self.cb_acodec = QComboBox(tab_format)
         self.cb_acodec.addItems(["Melhor", "AAC", "MP3", "Opus"])
@@ -705,7 +705,7 @@ class InspectorPanel(QFrame):
         self.cb_container.blockSignals(True)
         self.cb_container.clear()
         if is_video:
-            self.cb_container.addItems(["mp4", "mkv", "webm"])
+            self.cb_container.addItems(["mp4", "mkv", "webm", "avi"])
         else:
             self.cb_container.addItems(["flac", "mp3", "wav", "m4a", "opus"])
         self.cb_container.blockSignals(False)
