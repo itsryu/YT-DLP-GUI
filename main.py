@@ -33,19 +33,113 @@ import processamento as proc
 
 # =====================================================================
 # INJEÇÃO DE AMBIENTE SANDBOXED
-# O yt-dlp utiliza o Deno para executar algoritmos JS de resolução de URL.
-# Para evitar que o Deno tente acessar o sistema de arquivos ou a rede diretamente,
-# injetamos variáveis de ambiente que apontam para locais controlados e seguros.
 # =====================================================================
 PROJECT_DIR = str(Path(__file__).parent.absolute())
 if PROJECT_DIR not in os.environ.get("PATH", ""):
     os.environ["PATH"] = f"{PROJECT_DIR};{os.environ.get('PATH', '')}"
 # =====================================================================
 
+# =====================================================================
+# MONKEY PATCH: Transmutador Dinâmico de Exceções e Resolução Heurística
+# =====================================================================
+def _patched_get_filepath(self: Any, info_dict: dict[str, Any]) -> Optional[Path]:
+    if info_dict.get('_type') == 'playlist' or 'entries' in info_dict:
+        entries = info_dict.get('entries', [])
+        if entries:
+            info_dict = entries[0]
+            
+    req_dl = info_dict.get('requested_downloads')
+    if req_dl and isinstance(req_dl, list):
+        filepath = req_dl[0].get('filepath') or req_dl[0].get('_filename')
+        if filepath: return Path(filepath)
+        
+    filepath = info_dict.get('filepath') or info_dict.get('_filename')
+    if filepath: return Path(filepath)
+    
+    temp_dir = getattr(self, '_temp_dir', None)
+    if temp_dir and temp_dir.exists():
+        files = [f for f in temp_dir.iterdir() if f.is_file() and not f.name.endswith('.part') and not f.name.endswith('.ytdl')]
+        if files:
+            files.sort(key=lambda x: x.stat().st_size, reverse=True)
+            return files[0]
+            
+    return None
+
+def _patched_apply_flags(self: Any, opts: dict[str, Any]) -> None:
+    if not self.config.custom_flags: return
+    try:
+        import shlex
+        from yt_dlp.utils import match_filter_func
+        
+        tokens = shlex.split(self.config.custom_flags)
+        i = 0
+        while i < len(tokens):
+            flag = tokens[i]
+            if flag.startswith('--'):
+                key = flag[2:].replace('-', '_')
+                if i + 1 < len(tokens) and not tokens[i+1].startswith('--'):
+                    val = tokens[i+1]
+                    i += 2
+                    
+                    if key == 'extractor_args' and ':' in val and '=' in val:
+                        extractor, rest = val.split(':', 1)
+                        arg_k, arg_v = rest.split('=', 1)
+                        
+                        ext_dict = opts.setdefault('extractor_args', {})
+                        if not isinstance(ext_dict, dict):
+                            ext_dict = {}
+                            opts['extractor_args'] = ext_dict
+                            
+                        ext_args = ext_dict.setdefault(extractor, {})
+                        if isinstance(ext_args, list):
+                            ext_args.append(f"{arg_k}={arg_v}")
+                        elif isinstance(ext_args, dict):
+                            ext_args[arg_k] = [arg_v]
+                    elif key == 'match_filter':
+                        opts[key] = match_filter_func(val)
+                    else: 
+                        opts[key] = val
+                else:
+                    opts[key] = True
+                    i += 1
+            else: i += 1
+    except Exception as e:
+        self._logger.error(f"Erro Léxico em Abstract Syntax Tree (Flags Customizadas): {e}")
+
+_original_run = proc.DownloadWorker.run
+def _patched_worker_run(self: Any) -> None:
+    spotify_thumb = getattr(self.config, 'spotify_thumb_url', None)
+    if spotify_thumb and not getattr(self.config, 'custom_cover_path', None):
+        try:
+            import urllib.request, ssl, uuid, tempfile
+            from pathlib import Path
+            from PyQt6.QtGui import QImage
+            
+            ctx = ssl.create_default_context()
+            req = urllib.request.Request(spotify_thumb, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=10, context=ctx) as response:
+                buffer = response.read()
+            
+            image = QImage()
+            if image.loadFromData(buffer):
+                safe_image = image.convertToFormat(QImage.Format.Format_RGB32)
+                temp_cover = Path(tempfile.gettempdir()) / f"spotify_cover_{uuid.uuid4().hex[:8]}.jpg"
+                safe_image.save(str(temp_cover), "JPG", 95)
+                object.__setattr__(self.config, "custom_cover_path", str(temp_cover))
+        except Exception as e:
+            self._logger.warning(f"Injeção assíncrona de miniatura Spotify abortada: {e}")
+            
+    _original_run(self)
+
+proc.DownloadWorker._get_downloaded_filepath = _patched_get_filepath
+proc.DownloadWorker._apply_raw_custom_flags = _patched_apply_flags
+proc.DownloadWorker.run = _patched_worker_run
+# =====================================================================
+
 T = TypeVar('T')
 
 APP_NAME: Final[str] = "SoundStream Pro"
-VERSION: Final[str] = "7.3.0"
+VERSION: Final[str] = "7.3.6"
 DEFAULT_DOWNLOAD_DIR: Final[Path] = Path.home() / "Downloads"
 MAX_CONCURRENT_DOWNLOADS: Final[int] = 3
 
@@ -709,7 +803,8 @@ class InspectorPanel(QFrame):
         ffmpeg_layout.addWidget(self.in_ffmpeg_path)
         ffmpeg_layout.addWidget(btn_browse_ffmpeg)
         
-        self.in_custom_flags = QLineEdit(dev_group)
+        default_flags = '--extractor-args "youtube:player_client=tv,web" --match-filter "!is_live & url!*=/shorts/"'
+        self.in_custom_flags = QLineEdit(default_flags, dev_group)
         
         dev_form.addRow("Template de Saída:", tmpl_layout)
         dev_form.addRow("Caminho FFmpeg:", ffmpeg_layout)

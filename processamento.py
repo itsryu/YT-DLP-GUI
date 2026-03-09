@@ -524,11 +524,10 @@ class YtDlpInterceptorLogger:
 class SubprocessDSPEngine:
     @staticmethod
     def execute_audio_pipeline(config: DownloadJobConfig, raw_filepath: Path, info_dict: dict[str, Any], temp_dir: Path, logger: logging.Logger) -> None:
-        
         if not raw_filepath.exists():
             possible_files = list(temp_dir.glob(f"{raw_filepath.stem}.*"))
             if possible_files: raw_filepath = possible_files[0]
-            else: raise RuntimeError(f"Ficheiro bruto de origem não encontrado: {raw_filepath}")
+            else: raise RuntimeError(f"Ficheiro de origem bloqueado ou inexistente: {raw_filepath}")
 
         ext = config.format_container
         out_filepath = raw_filepath.with_suffix(f".{ext}")
@@ -547,7 +546,7 @@ class SubprocessDSPEngine:
             temp_dir.mkdir(parents=True, exist_ok=True)
             if config.custom_cover_path and Path(config.custom_cover_path).exists():
                 cover_target_path = Path(config.custom_cover_path)
-                logger.info("[DSP] Matriz gráfica do MusicBrainz injetada com sucesso.")
+                logger.info("[DSP] Matriz gráfica injetada.")
             elif info_dict.get('thumbnail'):
                 thumb_bytes = YtDlpService.fetch_thumbnail_bytes_sync(info_dict['thumbnail'])
                 if thumb_bytes:
@@ -610,8 +609,8 @@ class SubprocessDSPEngine:
         try:
             subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
         except subprocess.CalledProcessError as e:
-            logger.error(f"Colapso DSP: {e.stderr}")
-            raise RuntimeError(f"FFmpeg falhou ao processar matriz: {e.stderr}")
+            logger.error(f"Kernel Panic em Subprocesso DSP: {e.stderr}")
+            raise RuntimeError(f"FFmpeg falhou ao processar matriz de áudio: {e.stderr}")
         finally:
             def safe_delete(p: Path) -> None:
                 if not p or not p.exists(): return
@@ -639,11 +638,11 @@ class DownloadWorker(QRunnable):
 
     def cancel(self) -> None:
         self._is_cancelled = True
-        self._logger.warning("Sinal de interrupção (SIGTERM logic) propagado.")
+        self._logger.warning("SIGTERM propagado em escopo local.")
 
     def _check_abort(self) -> None:
         if self._is_cancelled:
-            raise DownloadError("Operação de E/S vetada no escopo de utilizador.")
+            raise DownloadError("Operação de I/O revogada pelo Scheduler.")
 
     def _progress_hook(self, d: dict[str, Any]) -> None:
         self._check_abort()
@@ -658,12 +657,11 @@ class DownloadWorker(QRunnable):
             self.broker.emit_progress(self.config.job_id, percent, d.get('_speed_str', 'N/A'))
         
         elif status == 'finished':
-            self._logger.info("Ciclo de leitura binária saturado. Transição de estado.")
-            self.broker.emit_progress(self.config.job_id, 100.0, "Processing")
+            self._logger.info("Ciclo de leitura binária saturado. Despachando transição de estado.")
+            self.broker.emit_progress(self.config.job_id, 100.0, "Processing DSP")
 
     def _build_ydl_opts(self) -> dict[str, Any]:
         self._temp_dir.mkdir(parents=True, exist_ok=True)
-        
         filename_tmpl = self.config.output_template if self.config.output_template else f"{self.config.custom_filename}.%(ext)s"
         out_tmpl = str(self._temp_dir / filename_tmpl)
         
@@ -778,7 +776,7 @@ class DownloadWorker(QRunnable):
                         i += 1
                 else: i += 1
         except ValueError as e:
-            self._logger.error(f"Erro Léxico em Abstract Syntax Tree (Flags): {e}")
+            self._logger.error(f"Erro Léxico em Abstract Syntax Tree (Flags Customizadas): {e}")
 
     def _get_downloaded_filepath(self, info_dict: dict[str, Any]) -> Optional[Path]:
         req_dl = info_dict.get('requested_downloads')
@@ -802,39 +800,40 @@ class DownloadWorker(QRunnable):
                         break
                     except PermissionError as e:
                         if attempt == 4:
-                            self._logger.error(f"Falha definitiva ao mover artefacto (I/O Lock): {e}")
+                            self._logger.error(f"Falha de Concorrência ao relocar artefato (I/O Lock): {e}")
                             raise
                         import time
-
                         time.sleep(1.5)
 
         shutil.rmtree(self._temp_dir, ignore_errors=True)
 
     @pyqtSlot()
     def run(self) -> None:
-        self.broker.emit_status(self.config.job_id, "Iniciando topologia de descritores...")
+        self.broker.emit_status(self.config.job_id, "Aquisição de Socket...")
         try:
             ydl_opts = self._build_ydl_opts()
             with YtDlpService._network_semaphore:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    self.broker.emit_status(self.config.job_id, "Rotina I/O bloqueante alocada.")
+                    self.broker.emit_status(self.config.job_id, "Iniciando descarga binária...")
                     info_dict = ydl.extract_info(self.config.url, download=True)
             
             self._check_abort()
             
             if self.config.media_type == MediaType.AUDIO:
-                self.broker.emit_status(self.config.job_id, "Motor DSP em execução iterativa.")
+                self.broker.emit_status(self.config.job_id, "Alocando Motor DSP...")
                 raw_filepath = self._get_downloaded_filepath(cast(Dict[str, Any], info_dict))
                 if raw_filepath:
-                    SubprocessDSPEngine.execute_audio_pipeline(self.config, raw_filepath, cast(Dict[str, Any], info_dict), self._temp_dir, self._logger)
+                    SubprocessDSPEngine.execute_audio_pipeline(
+                        self.config, raw_filepath, cast(Dict[str, Any], info_dict), self._temp_dir, self._logger
+                    )
 
             self._finalize_move()
-            self.broker.emit_status(self.config.job_id, "Integridade Verificada.")
+            self.broker.emit_status(self.config.job_id, "Hash Validado e Completo.")
             
         except Exception as e:
             shutil.rmtree(self._temp_dir, ignore_errors=True)
             if not self._is_cancelled:
-                self._logger.error(f"Pânico no kernel ou falha no Pipe: {e}", exc_info=True)
+                self._logger.error(f"Exceção não tratada em Kernel Scope: {e}", exc_info=True)
                 self.broker.emit_error(str(e))
         finally:
             self.broker.emit_finished()
