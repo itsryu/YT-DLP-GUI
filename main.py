@@ -1317,7 +1317,6 @@ class MainWindow(QMainWindow):
     def _remove_from_queue(self, job_id: str) -> None:
         if job_id in self.active_runnables:
             self.active_runnables[job_id].cancel()
-            del self.active_runnables[job_id]
             
         row = self.get_row_by_id(job_id)
         if row >= 0:
@@ -1566,7 +1565,12 @@ class MainWindow(QMainWindow):
     def cancel_job(self, job_id: str) -> None:
         if job_id in self.active_runnables:
             self.active_runnables[job_id].cancel()
-            self._cleanup_job(job_id, "Cancelado", QColor("#ff9800"))
+            row = self.get_row_by_id(job_id)
+            if row >= 0:
+                item = self.table.item(row, 2)
+                if item is not None:
+                    item.setText("A Cancelar...")
+                    item.setForeground(QColor("#ff9800"))
 
     def _cleanup_job(self, job_id: str, status_text: str, color: QColor) -> None:
         row = self.get_row_by_id(job_id)
@@ -1600,8 +1604,11 @@ class MainWindow(QMainWindow):
             elif "Erro" in status_text:
                 self.table.setCellWidget(row, 4, QWidget())
                 
-        if job_id in self.active_runnables: 
-            del self.active_runnables[job_id]
+        def _safe_remove() -> None:
+            if job_id in self.active_runnables: 
+                del self.active_runnables[job_id]
+                
+        QTimer.singleShot(2500, _safe_remove)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         root_logger = logging.getLogger()
