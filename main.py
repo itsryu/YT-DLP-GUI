@@ -13,7 +13,7 @@ import time
 import ssl
 import tempfile
 from dataclasses import dataclass
-from typing import Callable, Final, Dict, Any, Optional, List, TypeVar
+from typing import Callable, Final, Dict, Any, Optional, List, TypeVar, Set
 from pathlib import Path
 from functools import wraps
 
@@ -139,7 +139,7 @@ proc.DownloadWorker.run = _patched_worker_run
 T = TypeVar('T')
 
 APP_NAME: Final[str] = "SoundStream Pro"
-VERSION: Final[str] = "7.3.6"
+VERSION: Final[str] = "7.3.7"
 DEFAULT_DOWNLOAD_DIR: Final[Path] = Path.home() / "Downloads"
 MAX_CONCURRENT_DOWNLOADS: Final[int] = 3
 
@@ -803,7 +803,7 @@ class InspectorPanel(QFrame):
         ffmpeg_layout.addWidget(self.in_ffmpeg_path)
         ffmpeg_layout.addWidget(btn_browse_ffmpeg)
         
-        default_flags = '--extractor-args "youtube:player_client=tv,web" --match-filter "!is_live & url!*=/shorts/"'
+        default_flags = '--extractor-args "youtube:player_client=tv,web" --match-filter "!is_live & url!*=/shorts/" --force-ipv4 --sleep-requests 1'
         self.in_custom_flags = QLineEdit(default_flags, dev_group)
         
         dev_form.addRow("Template de Saída:", tmpl_layout)
@@ -1090,6 +1090,8 @@ class MainWindow(QMainWindow):
         self.thread_pool.setMaxThreadCount(MAX_CONCURRENT_DOWNLOADS)
         self.active_runnables: Dict[str, proc.DownloadWorker] = {}
         
+        self._terminal_jobs: Set[str] = set()
+        
         self._current_meta: Optional[proc.NormalizedMediaEntity] = None
 
         self._analysis_cover_path: Optional[Path] = None
@@ -1317,6 +1319,7 @@ class MainWindow(QMainWindow):
     def _remove_from_queue(self, job_id: str) -> None:
         if job_id in self.active_runnables:
             self.active_runnables[job_id].cancel()
+            self._terminal_jobs.add(job_id)
             
         row = self.get_row_by_id(job_id)
         if row >= 0:
@@ -1429,7 +1432,6 @@ class MainWindow(QMainWindow):
             
             if is_search or target_url.startswith("ytmsearch") or target_url.startswith("ytsearch"):
                 query = target_url.split(":", 1)[-1] if ":" in target_url else target_url
-                
                 target_url = f'ytsearch1:{query.strip()} "Provided to YouTube"'
                 
             elif not target_url.startswith("http") and not target_url.startswith("ytsearch"):
@@ -1556,15 +1558,18 @@ class MainWindow(QMainWindow):
 
     def on_job_finished(self, job_id: str) -> None:
         if sip.isdeleted(self): return
+        if job_id in self._terminal_jobs: return
         self._cleanup_job(job_id, "✔ Concluído", QColor("#4caf50"))
 
     def on_job_error(self, job_id: str, err: str) -> None:
         if sip.isdeleted(self): return
+        self._terminal_jobs.add(job_id)
         self._cleanup_job(job_id, "✘ Erro", QColor("#d32f2f"))
 
     def cancel_job(self, job_id: str) -> None:
         if job_id in self.active_runnables:
             self.active_runnables[job_id].cancel()
+            self._terminal_jobs.add(job_id)
             row = self.get_row_by_id(job_id)
             if row >= 0:
                 item = self.table.item(row, 2)
