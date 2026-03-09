@@ -102,7 +102,7 @@ class APIRateLimiter:
                 if self.tokens >= 1.0:
                     self.tokens -= 1.0
                     return
-            
+                
                 sleep_time = (1.0 - self.tokens) / self.rate
                 self.condition.wait(timeout=sleep_time)
 
@@ -264,6 +264,7 @@ class MusicBrainzSignals(QObject):
 class CoverArtSignals(QObject):
     result_ready = pyqtSignal(QImage)
     error = pyqtSignal(str)
+
 class MusicBrainzWorker(QRunnable):
     def __init__(self, title_query: str, artist_query: str, album_query: str, date_query: str, app_name: str, version: str) -> None:
         super().__init__()
@@ -525,7 +526,7 @@ class InspectorPanel(QFrame):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setObjectName("Panel")
-        self._current_meta: Optional[proc.MediaMetadata] = None
+        self._current_meta: Optional[proc.NormalizedMediaEntity] = None
         self._init_ui()
 
     def _init_ui(self) -> None:
@@ -838,7 +839,7 @@ class InspectorPanel(QFrame):
         if path:
             self.in_ffmpeg_path.setText(path)
 
-    def set_metadata(self, meta: proc.MediaMetadata) -> None:
+    def set_metadata(self, meta: proc.NormalizedMediaEntity) -> None:
         if sip.isdeleted(self) or sip.isdeleted(self.in_filename): return
         self._current_meta = meta
         
@@ -851,15 +852,44 @@ class InspectorPanel(QFrame):
         if not sip.isdeleted(self.in_title): self.in_title.setText(meta.title)
         if not sip.isdeleted(self.in_artist): self.in_artist.setText(meta.artist)
         if not sip.isdeleted(self.in_album): self.in_album.setText(meta.album)
-        if not sip.isdeleted(self.in_date): self.in_date.setText(meta.upload_date[:4] if meta.upload_date else "")
-        if not sip.isdeleted(self.in_desc): self.in_desc.setPlainText(meta.description)
+        
+        if not sip.isdeleted(self.in_date): 
+            self.in_date.setText(meta.upload_date[:4] if meta.upload_date else "")
+        if not sip.isdeleted(self.in_desc): 
+            self.in_desc.setPlainText(meta.description if meta.description else "")
+            
         if not sip.isdeleted(self.in_genre): self.in_genre.clear()
         
+        is_audio_restricted = False
+        orig_id = getattr(meta, 'original_id', '')
+        if isinstance(orig_id, str) and ('ytmsearch' in orig_id or 'ytsearch' in orig_id):
+            is_audio_restricted = True
+            
+        if getattr(meta, 'is_playlist', False) and getattr(meta, 'children', None):
+            for c in meta.children:
+                c_id = getattr(c, 'original_id', '')
+                if isinstance(c_id, str) and ('ytmsearch' in c_id or 'ytsearch' in c_id):
+                    is_audio_restricted = True
+                    break
+
+        if is_audio_restricted:
+            self.rb_audio.setChecked(True)
+            self.rb_video.setEnabled(False)
+            self.rb_video.setToolTip("Vídeo bloqueado: A topologia de origem (YTM/Spotify) restringe a extração ao formato de áudio.")
+        else:
+            self.rb_video.setEnabled(True)
+            self.rb_video.setToolTip("")
+            
         self._recalc_estimate()
 
     def set_thumbnail(self, pixmap: QPixmap) -> None:
         if sip.isdeleted(self) or sip.isdeleted(self.thumb_lbl): return
         self.thumb_lbl.setPixmap(pixmap)
+
+    def clear_thumbnail(self) -> None:
+        if sip.isdeleted(self) or sip.isdeleted(self.thumb_lbl): return
+        self.thumb_lbl.clear()
+        self.thumb_lbl.setText("Sem Pré-visualização")
 
     def _update_ui_mode(self) -> None:
         is_video = self.rb_video.isChecked()
@@ -900,10 +930,19 @@ class InspectorPanel(QFrame):
 
     def _recalc_estimate(self) -> None:
         if sip.isdeleted(self) or sip.isdeleted(self.stats_lbl) or not self._current_meta: return
+        
+        origem_texto = "Desconhecida (Áudio/DRM)"
+        if getattr(self._current_meta, 'width', None) and getattr(self._current_meta, 'height', None):
+            origem_texto = f"{self._current_meta.width}x{self._current_meta.height} @ {getattr(self._current_meta, 'fps', 'N/A')}fps"
+
+        canal_formatado = getattr(self._current_meta, 'channel', "N/A")
+        if not canal_formatado:
+            canal_formatado = "N/A"
+        
         base_info = (
-            f"<b>Duração:</b> {self._current_meta.display_duration}<br>"
-            f"<b>Origem:</b> {self._current_meta.width}x{self._current_meta.height} @ {self._current_meta.fps}fps<br>"
-            f"<b>Canal:</b> {self._current_meta.channel}"
+            f"<b>Duração:</b> {getattr(self._current_meta, 'display_duration', 'N/A')}<br>"
+            f"<b>Origem:</b> {origem_texto}<br>"
+            f"<b>Canal:</b> {canal_formatado}"
         )
         self.stats_lbl.setText(base_info)
 
@@ -955,7 +994,8 @@ class MainWindow(QMainWindow):
         self.thread_pool = QThreadPool.globalInstance()
         self.thread_pool.setMaxThreadCount(MAX_CONCURRENT_DOWNLOADS)
         self.active_runnables: Dict[str, proc.DownloadWorker] = {}
-        self._current_meta: Optional[proc.MediaMetadata] = None
+        
+        self._current_meta: Optional[proc.NormalizedMediaEntity] = None
 
         self._analysis_cover_path: Optional[Path] = None
         self._custom_cover_path: Optional[Path] = None
@@ -971,6 +1011,30 @@ class MainWindow(QMainWindow):
         self.init_ui()
         self._init_menu_bar()
         self._apply_theme(is_dark=True)
+
+    def _check_cookie_format(self) -> bool:
+        cookie_path = Path("cookies.txt")
+        if not cookie_path.exists():
+            return True
+            
+        try:
+            with open(cookie_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read(100)
+                if "# Netscape HTTP Cookie File" not in content:
+                    QMessageBox.critical(
+                        self,
+                        "Erro de Integridade Léxica (Cookies)",
+                        "O ficheiro 'cookies.txt' foi detetado no diretório raiz, contudo, "
+                        "não obedece ao padrão 'Netscape HTTP Cookie File'.\n\n"
+                        "A ausência do cabeçalho causará uma exceção (LoadError) no motor yt-dlp.\n\n"
+                        "Mitigação Recomendada:\n"
+                        "Gere o ficheiro utilizando a extensão de navegador 'Get cookies.txt LOCALLY'."
+                    )
+                    return False
+        except Exception as e:
+            logging.warning(f"[I/O] Restrição ao validar heurística de cookies: {e}")
+            
+        return True
 
     @pyqtSlot(str)
     def _on_url_text_changed(self, text: str) -> None:
@@ -988,6 +1052,7 @@ class MainWindow(QMainWindow):
 
     def _reset_ui_state(self) -> None:
         if not sip.isdeleted(self.inspector):
+            self.inspector.clear_thumbnail()
             self.inspector.setVisible(False)
         if not sip.isdeleted(self.action_bar):
             self.action_bar.setVisible(False)
@@ -1177,6 +1242,13 @@ class MainWindow(QMainWindow):
         url = self.url_input.text().strip()
         if not url: return
         
+        if not self._check_cookie_format():
+            self._reset_ui_state()
+            return
+        
+        if not sip.isdeleted(self.inspector):
+            self.inspector.clear_thumbnail()
+        
         self.btn_analyze.setEnabled(False)
         self.btn_analyze.setText("A processar...")
         worker = proc.AnalysisWorker(url)
@@ -1188,10 +1260,11 @@ class MainWindow(QMainWindow):
         self.thread_pool.start(worker)
 
     @pyqtSlot(object)
-    def on_analysis_success(self, meta: proc.MediaMetadata) -> None:
+    def on_analysis_success(self, meta: proc.NormalizedMediaEntity) -> None:
         if sip.isdeleted(self) or sip.isdeleted(self.inspector): return
         self._current_meta = meta
         self.inspector.set_metadata(meta)
+        
         if not sip.isdeleted(self.inspector):
             self.inspector.setVisible(True)
         if not sip.isdeleted(self.action_bar):
@@ -1237,43 +1310,78 @@ class MainWindow(QMainWindow):
 
     def queue_download(self) -> None:
         if not self._current_meta: return
+        if not self._check_cookie_format(): return
+        
         data = self.inspector.get_config_delta()
         if not data: return
         
-        config = proc.DownloadJobConfig(
-            job_id=str(uuid.uuid4()),
-            url=self.url_input.text().strip(),
-            output_path=Path(self.path_input.text()),
-            media_type=data['media_type'],
-            format_container=data['format_container'],
-            audio_codec=data['audio_codec'],
-            video_codec=data['video_codec'],
-            quality_preset=data['quality_preset'],
-            audio_sample_rate=data['audio_sample_rate'],
-            audio_bitrate=str(data['audio_bitrate']),
-            custom_filename=data['custom_filename'],
-            meta_title=data['meta_title'],
-            meta_artist=data['meta_artist'],
-            meta_album=data['meta_album'],
-            meta_genre=data['meta_genre'],
-            meta_date=data['meta_date'],
-            meta_desc=data['meta_desc'],
-            embed_metadata=data['embed_meta'],
-            embed_thumbnail=data['embed_thumb'],
-            embed_subs=data['embed_subs'],
-            normalize_audio=data['norm_audio'],
-            use_browser_cookies=data['use_cookies']
+        entities_to_process: List[proc.NormalizedMediaEntity] = (
+            self._current_meta.children if getattr(self._current_meta, 'is_playlist', False) and self._current_meta.children
+            else [self._current_meta]
         )
-        
-        object.__setattr__(config, "audio_bit_depth", data.get('audio_bit_depth', 'auto'))
-        object.__setattr__(config, "output_template", data.get('output_template', ''))
-        object.__setattr__(config, "ffmpeg_path", data.get('ffmpeg_path', ''))
-        object.__setattr__(config, "custom_flags", data.get('custom_flags', ''))
 
-        final_cover = self._custom_cover_path if self._custom_cover_path else self._analysis_cover_path
-        object.__setattr__(config, "custom_cover_path", str(final_cover) if final_cover else "")
+        for entity in entities_to_process:
+            job_id = str(uuid.uuid4())
+            target_url = str(getattr(entity, 'original_id', ''))
+            is_search = getattr(entity, 'is_search_query', False)
+            
+            current_media_type = data['media_type']
+            current_format = data['format_container']
+            
+            if is_search:
+                current_media_type = proc.MediaType.AUDIO
+                if current_format in ['mp4', 'mkv', 'webm', 'avi']:
+                    current_format = 'mp3' 
+            
+            if is_search or target_url.startswith("ytmsearch") or target_url.startswith("ytsearch"):
+                query = target_url.split(":", 1)[-1] if ":" in target_url else target_url
+                
+                target_url = f'ytsearch1:{query.strip()} "Provided to YouTube"'
+                
+            elif not target_url.startswith("http") and not target_url.startswith("ytsearch"):
+                target_url = f"https://www.youtube.com/watch?v={target_url}"
 
-        self._spawn_download(config)
+            resolved_filename = data.get('custom_filename', 'output')
+            if getattr(self._current_meta, 'is_playlist', False):
+                safe_title = re.sub(r'[<>:"/\\|?*]', '', f"{entity.artist} - {entity.title}")
+                resolved_filename = safe_title.strip()
+
+            config = proc.DownloadJobConfig(
+                job_id=job_id,
+                url=target_url,
+                output_path=Path(self.path_input.text()),
+                media_type=current_media_type,
+                format_container=current_format,
+                audio_codec=data['audio_codec'],
+                video_codec=data['video_codec'],
+                quality_preset=data['quality_preset'],
+                audio_sample_rate=data['audio_sample_rate'],
+                audio_bitrate=str(data['audio_bitrate']),
+                custom_filename=resolved_filename,
+                meta_title=entity.title,
+                meta_artist=entity.artist,
+                meta_album=entity.album,
+                meta_genre=data.get('meta_genre', ''),
+                meta_date=entity.upload_date if getattr(entity, 'upload_date', None) else data.get('meta_date', ''),
+                meta_desc=entity.description if getattr(entity, 'description', None) else data.get('meta_desc', ''),
+                embed_metadata=data['embed_meta'],
+                embed_thumbnail=data['embed_thumb'],
+                embed_subs=data['embed_subs'],
+                normalize_audio=data['norm_audio'],
+                use_browser_cookies=data['use_cookies']
+            )
+            
+            object.__setattr__(config, "audio_bit_depth", data.get('audio_bit_depth', 'auto'))
+            object.__setattr__(config, "output_template", data.get('output_template', ''))
+            object.__setattr__(config, "ffmpeg_path", data.get('ffmpeg_path', ''))
+            object.__setattr__(config, "custom_flags", data.get('custom_flags', ''))
+
+            object.__setattr__(config, "spotify_thumb_url", getattr(entity, 'thumbnail_url', None))
+
+            final_cover = self._custom_cover_path if self._custom_cover_path else self._analysis_cover_path
+            object.__setattr__(config, "custom_cover_path", str(final_cover) if final_cover else "")
+
+            self._spawn_download(config)
         
         if not sip.isdeleted(self.inspector):
             self.inspector.setVisible(False)

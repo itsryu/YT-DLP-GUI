@@ -1,13 +1,55 @@
+"""
+Pipeline de Resolução e Processamento de Mídia (DSP e Extração)
+
+Este módulo implementa a orquestração multithread para extração de topologias de rede
+(YouTube, Spotify) e processamento de sinais digitais (DSP) via FFmpeg.
+
+Diretrizes de Segurança e Injeção de Dependências (OAuth2):
+-----------------------------------------------------------
+Com base nos princípios de isolamento de configuração documentados no manifesto 
+The Twelve-Factor App (https://12factor.net/config), o acoplamento de credenciais
+estáticas no código-fonte é estritamente vetado. O adaptador `SpotifyToYTMAdapter` 
+exige a injeção de credenciais via variáveis de ambiente do Sistema Operacional (OS).
+
+[1] Ambiente de Desenvolvimento (Dev/Local):
+    - Windows (PowerShell):
+        $env:SPOTIPY_CLIENT_ID="seu_client_id"
+        $env:SPOTIPY_CLIENT_SECRET="seu_client_secret"
+    - Unix/Linux/macOS (Bash/Zsh):
+        export SPOTIPY_CLIENT_ID="seu_client_id"
+        export SPOTIPY_CLIENT_SECRET="seu_client_secret"
+    - Interpretadores e IDEs (VSCode):
+        Alocar o dicionário de variáveis no arquivo `launch.json`:
+        "env": {"SPOTIPY_CLIENT_ID": "...", "SPOTIPY_CLIENT_SECRET": "..."}
+
+[2] Ambiente de Produção (Prod):
+    - Systemd (Daemons Linux):
+        Empregar a diretiva `EnvironmentFile=/etc/sua_app/secrets.env` na unit `.service`
+        com permissões restritas de leitura (chmod 600).
+    - Infraestrutura Imutável (Docker/Kubernetes):
+        Injetar as variáveis em tempo de execução via manifestos YAML (`env:` ou `secretKeyRef:`)
+        evitando a persistência de credenciais em imagens de contêiner.
+    - Mitigação Avançada: 
+        Para sistemas de alta disponibilidade, recomenda-se a alocação dinâmica de chaves 
+        em memória utilizando cofres criptográficos efêmeros (e.g., HashiCorp Vault).
+
+Nota de Degradação Graciosa (Graceful Degradation):
+A ausência das variáveis supracitadas não inviabiliza a alocação do pipeline. O sistema
+isolará a falha ao domínio do Spotify, preservando a integridade das sub-rotinas do YouTube.
+"""
+
 import logging
-import shutil
+import os
 import re
 import shlex
+import shutil
+import ssl
 import subprocess
 import threading
 import urllib.request
-import ssl
+import uuid
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
 from typing import Optional, Any, TypedDict, Dict, List, cast
@@ -16,28 +58,55 @@ try:
     import yt_dlp  # type: ignore
     from yt_dlp.utils import DownloadError  # type: ignore
 except ImportError as e:
-    raise ImportError(f"CRITICAL: Dependência em falta. {e}. Execute 'pip install yt-dlp'")
+    raise ImportError(f"CRITICAL: Dependência yt-dlp não resolvida. {e}")
 
-from PyQt6.QtCore import QObject, pyqtSignal, QRunnable, pyqtSlot
+try:
+    import spotipy  # type: ignore
+    from spotipy.oauth2 import SpotifyClientCredentials  # type: ignore
+except ImportError as e:
+    raise ImportError(f"CRITICAL: Dependência spotipy não resolvida. {e}")
+
+from PyQt6.QtCore import QObject, pyqtSignal, QRunnable, pyqtSlot, QThreadPool
 
 class MediaType(Enum):
     AUDIO = auto()
     VIDEO = auto()
 
 @dataclass(frozen=True)
-class MediaMetadata:
+class NormalizedMediaEntity:
+    original_id: str
     title: str
     artist: str
     album: str
-    duration: int
-    thumbnail_url: Optional[str]
-    width: Optional[int]
-    height: Optional[int]
-    fps: Optional[float]
-    display_duration: str
-    upload_date: str
-    description: str
-    channel: str
+    duration: int = 0
+    thumbnail_url: Optional[str] = None
+    is_playlist: bool = False
+    children: Optional[List['NormalizedMediaEntity']] = field(default_factory=list)
+    
+    upload_date: Optional[str] = None
+    description: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    fps: Optional[float] = None
+    channel: Optional[str] = None
+
+    @property
+    def display_duration(self) -> str:
+        if self.duration <= 0:
+            return "N/A"
+        minutes, seconds = divmod(self.duration, 60)
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}" if hours > 0 else f"{minutes:02d}:{seconds:02d}"
+
+    @property
+    def is_search_query(self) -> bool:
+        return self.original_id.startswith("ytmsearch")
+
+    @property
+    def ytm_search_query(self) -> str:
+        query = f"{self.title} {self.artist}".strip()
+        query = re.sub(r'[^\w\s-]', '', query)
+        return f"ytmsearch1:{query}"
 
 @dataclass(frozen=True)
 class DownloadJobConfig:
@@ -57,7 +126,6 @@ class DownloadJobConfig:
     output_template: str = ''
     ffmpeg_path: str = ''
     custom_flags: str = ''
-    
     custom_cover_path: str = ''
     
     meta_title: str = ''
@@ -74,9 +142,11 @@ class DownloadJobConfig:
     use_browser_cookies: bool = False
 
 class YtDlpExtractedInfo(TypedDict, total=False):
+    id: str
     title: str
     artist: str
     uploader: str
+    channel: str
     album: str
     genre: str
     duration: int
@@ -88,6 +158,8 @@ class YtDlpExtractedInfo(TypedDict, total=False):
     upload_date: str
     description: str
     comment: str
+    entries: List['YtDlpExtractedInfo']
+    _type: str
 
 class IMessageBroker(ABC):
     @abstractmethod
@@ -122,9 +194,133 @@ class PyQtMessageBroker(IMessageBroker):
     def emit_status(self, job_id: str, status: str) -> None: self.signals.status.emit(job_id, status)
     def emit_thumbnail(self, data: bytes) -> None: self.signals.thumbnail_data.emit(data)
 
+class SpotifyToYTMAdapter:
+    def __init__(self) -> None:
+        self._logger = logging.getLogger(self.__class__.__name__)
+        self.client: Optional[spotipy.Spotify] = None
+        
+        client_id = os.environ.get("SPOTIPY_CLIENT_ID")
+        client_secret = os.environ.get("SPOTIPY_CLIENT_SECRET")
+        
+        if client_id and client_secret:
+            auth_manager = SpotifyClientCredentials(client_id=client_id, client_secret=client_secret)
+            self.client = spotipy.Spotify(auth_manager=auth_manager)
+        else:
+            self._logger.warning("[Auth] Credenciais do Spotify ausentes no ambiente. Instância operando em modo degradado.")
+
+    def is_spotify_url(self, url: str) -> bool:
+        return "open.spotify.com" in url
+
+    def resolve(self, url: str) -> NormalizedMediaEntity:
+        if not self.client:
+            raise RuntimeError(
+                "Motor de resolução Spotify inoperante: Credenciais OAuth2 não configuradas.\n\n"
+                "Para restabelecer a comunicação DRM, injete as variáveis no ambiente de execução:\n\n"
+                "[Windows PowerShell]:\n"
+                "$env:SPOTIPY_CLIENT_ID=\"seu_client_id\"\n"
+                "$env:SPOTIPY_CLIENT_SECRET=\"seu_client_secret\"\n\n"
+                "[Unix / macOS / Bash]:\n"
+                "export SPOTIPY_CLIENT_ID=\"seu_client_id\"\n"
+                "export SPOTIPY_CLIENT_SECRET=\"seu_client_secret\"\n\n"
+                "Reinicialize a aplicação após a alocação."
+            )
+            
+        if "playlist" in url:
+            return self._resolve_playlist(url)
+        elif "track" in url:
+            return self._resolve_track(url)
+        elif "album" in url:
+            return self._resolve_album(url)
+        raise ValueError("Topologia Spotify não reconhecida (apenas Track, Album, Playlist).")
+
+    def _resolve_track(self, url: str) -> NormalizedMediaEntity:
+        track_id = self._extract_id(url, "track")
+        track_data = self.client.track(track_id)
+        return self._map_track_to_entity(track_data)
+
+    def _resolve_playlist(self, url: str) -> NormalizedMediaEntity:
+        playlist_id = self._extract_id(url, "playlist")
+        playlist_info = self.client.playlist(playlist_id, fields='name,owner')
+        results = self.client.playlist_items(playlist_id, additional_types=['track'])
+        
+        entities: List[NormalizedMediaEntity] = []
+        for item in results.get('items', []):
+            track = item.get('track')
+            if track:
+                entities.append(self._map_track_to_entity(track))
+                
+        return NormalizedMediaEntity(
+            original_id=playlist_id,
+            title=playlist_info.get('name', 'Unknown Playlist'),
+            artist="Various Artists",
+            album=playlist_info.get('name', 'Unknown Playlist'),
+            is_playlist=True,
+            children=entities
+        )
+
+    def _resolve_album(self, url: str) -> NormalizedMediaEntity:
+        album_id = self._extract_id(url, "album")
+        album_info = self.client.album(album_id)
+        results = self.client.album_tracks(album_id)
+        
+        entities: List[NormalizedMediaEntity] = []
+        for track in results.get('items', []):
+            entities.append(self._map_track_to_entity(track, album_override=album_info.get('name', '')))
+            
+        return NormalizedMediaEntity(
+            original_id=album_id,
+            title=album_info.get('name', 'Unknown Album'),
+            artist=album_info['artists'][0].get('name', 'Unknown') if album_info.get('artists') else 'Unknown',
+            album=album_info.get('name', 'Unknown Album'),
+            is_playlist=True,
+            children=entities
+        )
+
+    def _map_track_to_entity(self, track_data: Dict[str, Any], album_override: str = "") -> NormalizedMediaEntity:
+        artist = track_data['artists'][0].get('name', 'Unknown') if track_data.get('artists') else 'Unknown'
+        album = album_override or track_data.get('album', {}).get('name', '')
+        release_date = track_data.get('album', {}).get('release_date')
+        
+        thumb = None
+        if track_data.get('album') and track_data['album'].get('images'):
+            thumb = track_data['album']['images'][0].get('url')
+            
+        entity = NormalizedMediaEntity(
+            original_id=track_data.get('id', ''),
+            title=track_data.get('name', ''),
+            artist=artist,
+            album=album,
+            duration=int(track_data.get('duration_ms', 0) / 1000),
+            thumbnail_url=thumb,
+            is_playlist=False,
+            upload_date=release_date,
+            description=None,
+            channel=None
+        )
+        
+        return NormalizedMediaEntity(
+            original_id=entity.ytm_search_query,
+            title=entity.title,
+            artist=entity.artist,
+            album=entity.album,
+            duration=entity.duration,
+            thumbnail_url=entity.thumbnail_url,
+            is_playlist=False,
+            upload_date=entity.upload_date,
+            description=entity.description,
+            channel=entity.channel
+        )
+
+    @staticmethod
+    def _extract_id(url: str, entity_type: str) -> str:
+        match = re.search(fr"spotify\.com/{entity_type}/([a-zA-Z0-9]+)", url)
+        if not match:
+            raise ValueError(f"URL corrompida: Falha na extração de hash de {entity_type}.")
+        return match.group(1)
+
 class YtDlpService:
     URL_REGEX = re.compile(
-        r'^(https?://)?(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com|vimeo\.com|soundcloud\.com)/.+$'
+        r'^(https?://)?(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com|vimeo\.com|soundcloud\.com|open\.spotify\.com)/.+$'
     )
     _network_semaphore = threading.BoundedSemaphore(value=5)
 
@@ -134,13 +330,12 @@ class YtDlpService:
 
     @classmethod
     def extract_info_sync(cls, url: str) -> YtDlpExtractedInfo:
-        logging.debug(f"[Network] Aguardando liberação de semáforo para extração de topologia: {url}")
+        logging.debug(f"[Network] Semáforo de rede adquirido: {url}")
         with cls._network_semaphore:
-            
             ydl_opts: Dict[str, Any] = {
                 'quiet': True,
                 'no_warnings': True,
-                'extract_flat': False,
+                'extract_flat': 'in_playlist',
                 'socket_timeout': 15,
                 'logger': logging.getLogger('yt_dlp_internal'),
                 'remote_components': ['ejs:github'],
@@ -156,24 +351,17 @@ class YtDlpService:
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=False)
-                    
             except DownloadError as e:
                 error_msg = str(e).lower()
                 if "sign in to confirm" in error_msg or "bot" in error_msg:
                     msg = (
-                        "Colapso de Camada de Rede: Interceção pelo WAF do YouTube (Anti-Bot).\n\n"
-                        "Ações de Mitigação Exigidas:\n"
-                        "1. Instale um interpretador JavaScript nativo (ex: 'winget install OpenJS.NodeJS') para resolução de criptografia PoW em runtime.\n"
-                        "2. Exporte a sua sessão autenticada utilizando a extensão de navegador 'Get cookies.txt LOCALLY'.\n"
-                        "3. Coloque o ficheiro resultante com o nome exato 'cookies.txt' no diretório onde o seu script é executado."
+                        "Interceção WAF (YouTube Anti-Bot).\n"
+                        "Mitigação requerida: Injete cookies válidos ('cookies.txt') no diretório raiz."
                     )
                     logging.critical(f"[Security] WAF Triggered. {msg}")
                     raise RuntimeError(msg)
-                else:
-                    raise
+                raise
 
-            if info and 'entries' in info:
-                info = info['entries'][0]
             return cast(YtDlpExtractedInfo, info)
 
     @classmethod
@@ -184,8 +372,132 @@ class YtDlpService:
             with urllib.request.urlopen(req, timeout=10, context=ctx) as response:
                 return response.read()
         except Exception as e:
-            logging.error(f"[I/O] Falha na aquisição de matriz RAW da miniatura: {e}")
+            logging.error(f"[I/O] Falha na aquisição binária (Thumbnail): {e}")
             return None
+
+class AnalysisWorker(QRunnable):
+    def __init__(self, url: str) -> None:
+        super().__init__()
+        self.url = url
+        self._signals = WorkerSignals()
+        self.broker = PyQtMessageBroker(self._signals)
+        self.spotify_adapter = SpotifyToYTMAdapter()
+
+    @property
+    def signals(self) -> WorkerSignals:
+        return self._signals
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            if self.spotify_adapter.is_spotify_url(self.url):
+                entity = self.spotify_adapter.resolve(self.url)
+            else:
+                info = YtDlpService.extract_info_sync(self.url)
+                entity = self._map_ytdlp_to_entity(info)
+
+            self.broker.emit_result(entity)
+
+            if entity.thumbnail_url and not entity.is_playlist:
+                data = YtDlpService.fetch_thumbnail_bytes_sync(entity.thumbnail_url)
+                if data:
+                    self.broker.emit_thumbnail(data)
+                    
+        except Exception as e:
+            logging.exception("Sub-rotina de análise interceptada com exceção crítica.")
+            self.broker.emit_error(str(e))
+        finally:
+            self.broker.emit_finished()
+
+    def _map_ytdlp_to_entity(self, info: YtDlpExtractedInfo) -> NormalizedMediaEntity:
+        is_playlist = info.get('_type') == 'playlist' or 'entries' in info
+        
+        if is_playlist:
+            children: List[NormalizedMediaEntity] = []
+            for entry in info.get('entries', []):
+                if entry:
+                    children.append(self._map_ytdlp_to_entity(entry))
+            
+            return NormalizedMediaEntity(
+                original_id=info.get('id', ''),
+                title=info.get('title', 'Unknown Playlist'),
+                artist=info.get('uploader', 'Unknown'),
+                album=info.get('title', ''),
+                is_playlist=True,
+                children=children,
+                upload_date=None,
+                description=None,
+                width=None,
+                height=None,
+                fps=None,
+                channel=info.get('channel') or info.get('uploader')
+            )
+        else:
+            return NormalizedMediaEntity(
+                original_id=info.get('id', ''),
+                title=info.get('title', 'Unknown'),
+                artist=info.get('artist', info.get('uploader', 'Unknown')),
+                album=info.get('album', ''),
+                duration=info.get('duration', 0),
+                thumbnail_url=info.get('thumbnail'),
+                is_playlist=False,
+                upload_date=info.get('upload_date'),
+                description=info.get('description'),
+                width=info.get('width'),
+                height=info.get('height'),
+                fps=info.get('fps'),
+                channel=info.get('channel') or info.get('uploader')
+            )
+
+class PlaylistDispatcher:
+    def __init__(self, thread_pool: QThreadPool) -> None:
+        self.thread_pool = thread_pool
+        self._logger = logging.getLogger(self.__class__.__name__)
+
+    def orchestrate_download(self, root_entity: NormalizedMediaEntity, base_config: DownloadJobConfig) -> None:
+        if not root_entity.is_playlist:
+            self._dispatch_worker(root_entity, base_config)
+            return
+
+        children = root_entity.children or []
+        self._logger.info(f"Topologia em Árvore detectada. Forking de {len(children)} workers concorrentes.")
+        
+        for child in children:
+            self._dispatch_worker(child, base_config)
+
+    def _dispatch_worker(self, entity: NormalizedMediaEntity, base_config: DownloadJobConfig) -> None:
+        job_id = uuid.uuid4().hex[:12]
+        target_url = entity.original_id if entity.is_search_query else f"https://www.youtube.com/watch?v={entity.original_id}"
+        
+        thread_safe_config = DownloadJobConfig(
+            job_id=job_id,
+            url=target_url,
+            output_path=base_config.output_path,
+            custom_filename=f"{entity.artist} - {entity.title}".replace("/", "_"),
+            media_type=base_config.media_type,
+            format_container=base_config.format_container,
+            audio_codec=base_config.audio_codec,
+            video_codec=base_config.video_codec,
+            quality_preset=base_config.quality_preset,
+            audio_sample_rate=base_config.audio_sample_rate,
+            audio_bitrate=base_config.audio_bitrate,
+            audio_bit_depth=base_config.audio_bit_depth,
+            output_template=base_config.output_template,
+            ffmpeg_path=base_config.ffmpeg_path,
+            custom_flags=base_config.custom_flags,
+            custom_cover_path=base_config.custom_cover_path,
+            meta_title=entity.title,
+            meta_artist=entity.artist,
+            meta_album=entity.album,
+            meta_date=entity.upload_date if entity.upload_date else base_config.meta_date,
+            meta_desc=entity.description if entity.description else base_config.meta_desc,
+            embed_metadata=base_config.embed_metadata,
+            embed_thumbnail=base_config.embed_thumbnail,
+            normalize_audio=base_config.normalize_audio
+        )
+
+        worker = DownloadWorker(thread_safe_config)
+        self.thread_pool.start(worker)
 
 class YtDlpInterceptorLogger:
     def __init__(self, job_id: str, check_abort_callback: Any) -> None:
@@ -310,49 +622,6 @@ class SubprocessDSPEngine:
             
             if raw_filepath.exists() and raw_filepath.absolute() != out_filepath.absolute(): safe_delete(raw_filepath)
             if cover_target_path and "cover_art_fallback" in cover_target_path.name: safe_delete(cover_target_path)
-class AnalysisWorker(QRunnable):
-    def __init__(self, url: str) -> None:
-        super().__init__()
-        self.url = url
-        self._signals = WorkerSignals()
-        self.broker = PyQtMessageBroker(self._signals)
-
-    @property
-    def signals(self) -> WorkerSignals:
-        return self._signals
-
-    @pyqtSlot()
-    def run(self) -> None:
-        try:
-            info = YtDlpService.extract_info_sync(self.url)
-            
-            meta = MediaMetadata(
-                title=info.get('title', 'Unknown'),
-                artist=info.get('artist', info.get('uploader', 'Unknown')),
-                album=info.get('album', ''),
-                duration=info.get('duration', 0),
-                thumbnail_url=info.get('thumbnail'),
-                width=info.get('width'),
-                height=info.get('height'),
-                fps=info.get('fps'),
-                display_duration=info.get('duration_string', 'N/A'),
-                upload_date=info.get('upload_date', ''),
-                description=info.get('description', ''),
-                channel=info.get('uploader', '')
-            )
-            
-            self.broker.emit_result(meta)
-
-            if meta.thumbnail_url:
-                data = YtDlpService.fetch_thumbnail_bytes_sync(meta.thumbnail_url)
-                if data:
-                    self.broker.emit_thumbnail(data)
-                    
-        except Exception as e:
-            logging.exception("Sub-rotina de análise interceptada com exceção.")
-            self.broker.emit_error(str(e))
-        finally:
-            self.broker.emit_finished()
 
 class DownloadWorker(QRunnable):
     def __init__(self, config: DownloadJobConfig) -> None:

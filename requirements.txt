@@ -3,3 +3,4 @@ yt_dlp
 mutagen
 requests
 aiohttp
+spotipy
