@@ -31,10 +31,17 @@ from PyQt6 import sip
 
 import processamento as proc
 
+# =====================================================================
+# INJEÇÃO DE AMBIENTE SANDBOXED
+# =====================================================================
 PROJECT_DIR = str(Path(__file__).parent.absolute())
 if PROJECT_DIR not in os.environ.get("PATH", ""):
     os.environ["PATH"] = f"{PROJECT_DIR};{os.environ.get('PATH', '')}"
+# =====================================================================
 
+# =====================================================================
+# MONKEY PATCH: Transmutador Dinâmico de Exceções e Resolução Heurística
+# =====================================================================
 def _patched_get_filepath(self: Any, info_dict: dict[str, Any]) -> Optional[Path]:
     if info_dict.get('_type') == 'playlist' or 'entries' in info_dict:
         entries = info_dict.get('entries', [])
@@ -87,7 +94,7 @@ def _patched_apply_flags(self: Any, opts: dict[str, Any]) -> None:
                         if isinstance(ext_args, list):
                             ext_args.append(f"{arg_k}={arg_v}")
                         elif isinstance(ext_args, dict):
-                            ext_args[arg_k] = [arg_v]
+                            ext_args.setdefault(arg_k, []).append(arg_v)
                     elif key == 'match_filter':
                         opts[key] = match_filter_func(val)
                     else: 
@@ -132,7 +139,7 @@ proc.DownloadWorker.run = _patched_worker_run
 T = TypeVar('T')
 
 APP_NAME: Final[str] = "SoundStream Pro"
-VERSION: Final[str] = "7.3.7"
+VERSION: Final[str] = "7.4.2"
 DEFAULT_DOWNLOAD_DIR: Final[Path] = Path.home() / "Downloads"
 MAX_CONCURRENT_DOWNLOADS: Final[int] = 3
 
@@ -796,7 +803,9 @@ class InspectorPanel(QFrame):
         ffmpeg_layout.addWidget(self.in_ffmpeg_path)
         ffmpeg_layout.addWidget(btn_browse_ffmpeg)
         
-        default_flags = '--extractor-args "youtube:player_client=tv,web" --match-filter "!is_live & url!*=/shorts/" --force-ipv4 --sleep-requests 1'
+        # INJEÇÃO ESTRITA: Mitigação de HTTP 403 (Forbidden) via supressão do player web.
+        # Desliga o web_player (para evitar JS challenges massivos em HLS) e aponta para TV/Mobile.
+        default_flags = '--extractor-args "youtube:player_client=tv,mweb" --extractor-args "youtube:player_skip=webpage,configs" --match-filter "!is_live & url!*=/shorts/" --force-ipv4'
         self.in_custom_flags = QLineEdit(default_flags, dev_group)
         
         dev_form.addRow("Template de Saída:", tmpl_layout)
@@ -948,22 +957,30 @@ class InspectorPanel(QFrame):
             
         if not sip.isdeleted(self.in_genre): self.in_genre.clear()
         
+        is_playlist = getattr(meta, 'is_playlist', False)
+        
+        self.tabs.setTabEnabled(1, not is_playlist)
+        if is_playlist:
+            self.tabs.setTabToolTip(1, "Metadados globais bloqueados para transações em lote (Playlists).")
+        else:
+            self.tabs.setTabToolTip(1, "")
+        
         is_audio_restricted = False
         orig_id = getattr(meta, 'original_id', '')
-        if isinstance(orig_id, str) and ('ytmsearch' in orig_id or 'ytsearch' in orig_id):
+        if isinstance(orig_id, str) and ('ytmsearch' in orig_id or 'ytsearch' in orig_id or 'music.youtube' in orig_id):
             is_audio_restricted = True
             
-        if getattr(meta, 'is_playlist', False) and getattr(meta, 'children', None):
+        if getattr(meta, 'children', None):
             for c in meta.children:
                 c_id = getattr(c, 'original_id', '')
-                if isinstance(c_id, str) and ('ytmsearch' in c_id or 'ytsearch' in c_id):
+                if isinstance(c_id, str) and ('ytmsearch' in c_id or 'ytsearch' in c_id or 'music.youtube' in c_id):
                     is_audio_restricted = True
                     break
 
         if is_audio_restricted:
             self.rb_audio.setChecked(True)
             self.rb_video.setEnabled(False)
-            self.rb_video.setToolTip("Vídeo bloqueado: A topologia de origem (YTM/Spotify) restringe a extração ao formato de áudio.")
+            self.rb_video.setToolTip("Vídeo bloqueado: A topologia de origem restringe a extração ao formato de áudio.")
         else:
             self.rb_video.setEnabled(True)
             self.rb_video.setToolTip("")
@@ -1081,8 +1098,9 @@ class MainWindow(QMainWindow):
         
         self.thread_pool = QThreadPool.globalInstance()
         self.thread_pool.setMaxThreadCount(MAX_CONCURRENT_DOWNLOADS)
-        self.active_runnables: Dict[str, proc.DownloadWorker] = {}
         
+        self.active_runnables: Dict[str, proc.DownloadWorker] = {}
+        self.job_configs: Dict[str, proc.DownloadJobConfig] = {}
         self._terminal_jobs: Set[str] = set()
         
         self._current_meta: Optional[proc.NormalizedMediaEntity] = None
@@ -1294,6 +1312,12 @@ class MainWindow(QMainWindow):
                     action_cancel = QAction("Cancelar Transferência", self)
                     action_cancel.triggered.connect(lambda _, jid=job_id: self.cancel_job(jid))
                     menu.addAction(action_cancel)
+                else:
+                    status_item = self.table.item(row, 2)
+                    if status_item and ("Erro" in status_item.text() or "Cancelado" in status_item.text()):
+                        action_retry = QAction("Tentar Novamente", self)
+                        action_retry.triggered.connect(lambda _, jid=job_id: self.retry_job(jid))
+                        menu.addAction(action_retry)
                     
                 menu.addSeparator()
             
@@ -1314,6 +1338,9 @@ class MainWindow(QMainWindow):
             self.active_runnables[job_id].cancel()
             self._terminal_jobs.add(job_id)
             
+        if job_id in self.job_configs:
+            del self.job_configs[job_id]
+            
         row = self.get_row_by_id(job_id)
         if row >= 0:
             self.table.removeRow(row)
@@ -1322,6 +1349,9 @@ class MainWindow(QMainWindow):
         for row in range(self.table.rowCount() - 1, -1, -1):
             status_item = self.table.item(row, 2)
             if status_item is not None and status_item.text() in ["✔ Concluído", "✘ Erro", "Cancelado"]:
+                job_id = self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+                if job_id in self.job_configs:
+                    del self.job_configs[job_id]
                 self.table.removeRow(row)
 
     def toggle_dev_mode(self, checked: bool) -> None:
@@ -1413,17 +1443,19 @@ class MainWindow(QMainWindow):
         for entity in entities_to_process:
             job_id = str(uuid.uuid4())
             target_url = str(getattr(entity, 'original_id', ''))
-            is_search = getattr(entity, 'is_search_query', False)
+            
+            # Operador Lógico Expandido: Bloqueia HLS/Vídeo em links Singulares do YT Music
+            is_audio_centric = getattr(entity, 'is_search_query', False) or "music.youtube" in target_url or "spotify" in target_url
             
             current_media_type = data['media_type']
             current_format = data['format_container']
             
-            if is_search:
+            if is_audio_centric:
                 current_media_type = proc.MediaType.AUDIO
                 if current_format in ['mp4', 'mkv', 'webm', 'avi']:
                     current_format = 'mp3' 
             
-            if is_search or target_url.startswith("ytmsearch") or target_url.startswith("ytsearch"):
+            if getattr(entity, 'is_search_query', False) or target_url.startswith("ytmsearch") or target_url.startswith("ytsearch"):
                 query = target_url.split(":", 1)[-1] if ":" in target_url else target_url
                 target_url = f'ytsearch1:{query.strip()} "Provided to YouTube"'
                 
@@ -1469,8 +1501,9 @@ class MainWindow(QMainWindow):
 
             final_cover = self._custom_cover_path if self._custom_cover_path else self._analysis_cover_path
             object.__setattr__(config, "custom_cover_path", str(final_cover) if final_cover else "")
-
-            self._spawn_download(config)
+            
+            self.job_configs[job_id] = config
+            self._spawn_download(config, is_retry=False)
         
         if not sip.isdeleted(self.inspector):
             self.inspector.setVisible(False)
@@ -1478,15 +1511,51 @@ class MainWindow(QMainWindow):
             self.action_bar.setVisible(False)
         self.url_input.clear()
 
-    def _spawn_download(self, config: proc.DownloadJobConfig) -> None:
+    def retry_job(self, job_id: str) -> None:
+        if job_id in self._terminal_jobs:
+            self._terminal_jobs.remove(job_id)
+            
+        config = self.job_configs.get(job_id)
+        if not config: return
+        
+        row = self.get_row_by_id(job_id)
+        if row >= 0:
+            item = self.table.item(row, 2)
+            if item is not None:
+                item.setText("Na Fila (Retentativa)")
+                item.setData(Qt.ItemDataRole.ForegroundRole, None)
+                
+        self._spawn_download(config, is_retry=True)
+
+    def _spawn_download(self, config: proc.DownloadJobConfig, is_retry: bool = False) -> None:
         runnable = proc.DownloadWorker(config)
         runnable.signals.progress.connect(self.update_progress)
         runnable.signals.status.connect(self.update_status)
         runnable.signals.finished.connect(lambda: self.on_job_finished(config.job_id))
         runnable.signals.error.connect(lambda err: self.on_job_error(config.job_id, err))
         self.active_runnables[config.job_id] = runnable
-        self.add_table_row(config)
+        
+        if is_retry:
+            row = self.get_row_by_id(config.job_id)
+            if row >= 0:
+                self._reset_row_for_retry(row, config.job_id)
+        else:
+            self.add_table_row(config)
+            
         self.thread_pool.start(runnable)
+
+    def _reset_row_for_retry(self, row: int, job_id: str) -> None:
+        btn_cancel = QPushButton("Parar")
+        btn_cancel.setObjectName("Destructive")
+        btn_cancel.clicked.connect(lambda _, jid=job_id: self.cancel_job(jid))
+        
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(btn_cancel)
+        container = QWidget()
+        container.setLayout(layout)
+        
+        self.table.setCellWidget(row, 4, container)
 
     def add_table_row(self, config: proc.DownloadJobConfig) -> None:
         row = self.table.rowCount()
@@ -1552,6 +1621,8 @@ class MainWindow(QMainWindow):
     def on_job_finished(self, job_id: str) -> None:
         if sip.isdeleted(self): return
         if job_id in self._terminal_jobs: return
+        if job_id in self.job_configs:
+            del self.job_configs[job_id]
         self._cleanup_job(job_id, "✔ Concluído", QColor("#4caf50"))
 
     def on_job_error(self, job_id: str, err: str) -> None:
@@ -1593,14 +1664,21 @@ class MainWindow(QMainWindow):
                 container.setLayout(layout)
                 self.table.setCellWidget(row, 4, container)
                 
-            elif "Cancelado" in status_text:
+            elif "Cancelado" in status_text or "Erro" in status_text:
                 widget = self.table.cellWidget(row, 3)
                 if isinstance(widget, QProgressBar):
                     widget.setValue(0)
-                self.table.setCellWidget(row, 4, QWidget())
                 
-            elif "Erro" in status_text:
-                self.table.setCellWidget(row, 4, QWidget())
+                btn_retry = QPushButton("Tentar Novamente")
+                btn_retry.setObjectName("PrimaryAction")
+                btn_retry.clicked.connect(lambda _, jid=job_id: self.retry_job(jid))
+                
+                layout = QHBoxLayout()
+                layout.setContentsMargins(0, 0, 0, 0)
+                layout.addWidget(btn_retry)
+                container = QWidget()
+                container.setLayout(layout)
+                self.table.setCellWidget(row, 4, container)
                 
         def _safe_remove() -> None:
             if job_id in self.active_runnables: 
