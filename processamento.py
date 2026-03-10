@@ -1,43 +1,3 @@
-"""
-Pipeline de Resolução e Processamento de Mídia (DSP e Extração)
-
-Este módulo implementa a orquestração multithread para extração de topologias de rede
-(YouTube, Spotify) e processamento de sinais digitais (DSP) via FFmpeg.
-
-Diretrizes de Segurança e Injeção de Dependências (OAuth2):
------------------------------------------------------------
-Com base nos princípios de isolamento de configuração documentados no manifesto 
-The Twelve-Factor App (https://12factor.net/config), o acoplamento de credenciais
-estáticas no código-fonte é estritamente vetado. O adaptador `SpotifyToYTMAdapter` 
-exige a injeção de credenciais via variáveis de ambiente do Sistema Operacional (OS).
-
-[1] Ambiente de Desenvolvimento (Dev/Local):
-    - Windows (PowerShell):
-        $env:SPOTIPY_CLIENT_ID="seu_client_id"
-        $env:SPOTIPY_CLIENT_SECRET="seu_client_secret"
-    - Unix/Linux/macOS (Bash/Zsh):
-        export SPOTIPY_CLIENT_ID="seu_client_id"
-        export SPOTIPY_CLIENT_SECRET="seu_client_secret"
-    - Interpretadores e IDEs (VSCode):
-        Alocar o dicionário de variáveis no arquivo `launch.json`:
-        "env": {"SPOTIPY_CLIENT_ID": "...", "SPOTIPY_CLIENT_SECRET": "..."}
-
-[2] Ambiente de Produção (Prod):
-    - Systemd (Daemons Linux):
-        Empregar a diretiva `EnvironmentFile=/etc/sua_app/secrets.env` na unit `.service`
-        com permissões restritas de leitura (chmod 600).
-    - Infraestrutura Imutável (Docker/Kubernetes):
-        Injetar as variáveis em tempo de execução via manifestos YAML (`env:` ou `secretKeyRef:`)
-        evitando a persistência de credenciais em imagens de contêiner.
-    - Mitigação Avançada: 
-        Para sistemas de alta disponibilidade, recomenda-se a alocação dinâmica de chaves 
-        em memória utilizando cofres criptográficos efêmeros (e.g., HashiCorp Vault).
-
-Nota de Degradação Graciosa (Graceful Degradation):
-A ausência das variáveis supracitadas não inviabiliza a alocação do pipeline. O sistema
-isolará a falha ao domínio do Spotify, preservando a integridade das sub-rotinas do YouTube.
-"""
-
 import logging
 import os
 import re
@@ -48,6 +8,7 @@ import subprocess
 import threading
 import urllib.request
 import uuid
+import http.client
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -78,7 +39,7 @@ class NormalizedMediaEntity:
     title: str
     artist: str
     album: str
-    duration: int = 0
+    duration: float = 0.0  
     thumbnail_url: Optional[str] = None
     is_playlist: bool = False
     children: Optional[List['NormalizedMediaEntity']] = field(default_factory=list)
@@ -92,15 +53,16 @@ class NormalizedMediaEntity:
 
     @property
     def display_duration(self) -> str:
-        if self.duration <= 0:
+        safe_duration = int(float(self.duration)) if self.duration else 0
+        if safe_duration <= 0:
             return "N/A"
-        minutes, seconds = divmod(self.duration, 60)
+        minutes, seconds = divmod(safe_duration, 60)
         hours, minutes = divmod(minutes, 60)
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}" if hours > 0 else f"{minutes:02d}:{seconds:02d}"
 
     @property
     def is_search_query(self) -> bool:
-        return self.original_id.startswith("ytmsearch")
+        return self.original_id.startswith("ytmsearch") or self.original_id.startswith("ytsearch")
 
     @property
     def ytm_search_query(self) -> str:
@@ -143,13 +105,15 @@ class DownloadJobConfig:
 
 class YtDlpExtractedInfo(TypedDict, total=False):
     id: str
+    webpage_url: str
+    url: str
     title: str
     artist: str
     uploader: str
     channel: str
     album: str
     genre: str
-    duration: int
+    duration: float
     thumbnail: str
     width: int
     height: int
@@ -290,7 +254,7 @@ class SpotifyToYTMAdapter:
             title=track_data.get('name', ''),
             artist=artist,
             album=album,
-            duration=int(track_data.get('duration_ms', 0) / 1000),
+            duration=float(track_data.get('duration_ms', 0) / 1000.0),
             thumbnail_url=thumb,
             is_playlist=False,
             upload_date=release_date,
@@ -313,7 +277,7 @@ class SpotifyToYTMAdapter:
 
     @staticmethod
     def _extract_id(url: str, entity_type: str) -> str:
-        match = re.search(fr"spotify\.com/{entity_type}/([a-zA-Z0-9]+)", url)
+        match = re.search(fr"/{entity_type}/([a-zA-Z0-9]+)", url)
         if not match:
             raise ValueError(f"URL corrompida: Falha na extração de hash de {entity_type}.")
         return match.group(1)
@@ -366,14 +330,31 @@ class YtDlpService:
 
     @classmethod
     def fetch_thumbnail_bytes_sync(cls, url: str) -> Optional[bytes]:
-        try:
-            ctx = ssl.create_default_context()
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=10, context=ctx) as response:
-                return response.read()
-        except Exception as e:
-            logging.error(f"[I/O] Falha na aquisição binária (Thumbnail): {e}")
-            return None
+        ctx = ssl.create_default_context()
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=15, context=ctx) as response:
+                    buffer = bytearray()
+                    while True:
+                        try:
+                            chunk = response.read(8192)
+                            if not chunk:
+                                break
+                            buffer.extend(chunk)
+                        except http.client.IncompleteRead as e:
+                            logging.warning(f"[Network] IncompleteRead detetado ({len(e.partial)} bytes retidos). Transição de resiliência acionada.")
+                            buffer.extend(e.partial)
+                            break
+                    return bytes(buffer)
+            except Exception as e:
+                logging.warning(f"[I/O] Retentativa {attempt+1}/3 na aquisição de miniatura: {e}")
+                import time
+                time.sleep(1)
+                
+        logging.error(f"[I/O] Falha definitiva na aquisição binária da miniatura: {url}")
+        return None
 
 class AnalysisWorker(QRunnable):
     def __init__(self, url: str) -> None:
@@ -412,6 +393,8 @@ class AnalysisWorker(QRunnable):
     def _map_ytdlp_to_entity(self, info: YtDlpExtractedInfo) -> NormalizedMediaEntity:
         is_playlist = info.get('_type') == 'playlist' or 'entries' in info
         
+        canonical_id = info.get('webpage_url') or info.get('url') or info.get('id', '')
+        
         if is_playlist:
             children: List[NormalizedMediaEntity] = []
             for entry in info.get('entries', []):
@@ -419,7 +402,7 @@ class AnalysisWorker(QRunnable):
                     children.append(self._map_ytdlp_to_entity(entry))
             
             return NormalizedMediaEntity(
-                original_id=info.get('id', ''),
+                original_id=canonical_id,
                 title=info.get('title', 'Unknown Playlist'),
                 artist=info.get('uploader', 'Unknown'),
                 album=info.get('title', ''),
@@ -434,11 +417,11 @@ class AnalysisWorker(QRunnable):
             )
         else:
             return NormalizedMediaEntity(
-                original_id=info.get('id', ''),
+                original_id=canonical_id,
                 title=info.get('title', 'Unknown'),
                 artist=info.get('artist', info.get('uploader', 'Unknown')),
                 album=info.get('album', ''),
-                duration=info.get('duration', 0),
+                duration=float(info.get('duration', 0.0) or 0.0),
                 thumbnail_url=info.get('thumbnail'),
                 is_playlist=False,
                 upload_date=info.get('upload_date'),
@@ -607,7 +590,11 @@ class SubprocessDSPEngine:
         cmd.append(str(out_filepath))
         
         try:
-            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+            startupinfo = None
+            if os.name == 'nt':
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True, startupinfo=startupinfo)
         except subprocess.CalledProcessError as e:
             logger.error(f"Kernel Panic em Subprocesso DSP: {e.stderr}")
             raise RuntimeError(f"FFmpeg falhou ao processar matriz de áudio: {e.stderr}")
@@ -755,35 +742,10 @@ class DownloadWorker(QRunnable):
             opts['writesubtitles'] = True
 
     def _apply_raw_custom_flags(self, opts: dict[str, Any]) -> None:
-        if not self.config.custom_flags: return
-        try:
-            tokens = shlex.split(self.config.custom_flags)
-            i = 0
-            while i < len(tokens):
-                flag = tokens[i]
-                if flag.startswith('--'):
-                    key = flag[2:].replace('-', '_')
-                    if i + 1 < len(tokens) and not tokens[i+1].startswith('--'):
-                        val = tokens[i+1]
-                        i += 2
-                        if key == 'extractor_args' and ':' in val and '=' in val:
-                            extractor, rest = val.split(':', 1)
-                            arg_k, arg_v = rest.split('=', 1)
-                            opts.setdefault('extractor_args', {}).setdefault(extractor, {})[arg_k] = [arg_v]
-                        else: opts[key] = val
-                    else:
-                        opts[key] = True
-                        i += 1
-                else: i += 1
-        except ValueError as e:
-            self._logger.error(f"Erro Léxico em Abstract Syntax Tree (Flags Customizadas): {e}")
+        pass
 
     def _get_downloaded_filepath(self, info_dict: dict[str, Any]) -> Optional[Path]:
-        req_dl = info_dict.get('requested_downloads')
-        if req_dl and isinstance(req_dl, list) and req_dl[0].get('filepath'):
-            return Path(req_dl[0].get('filepath'))
-        filepath = info_dict.get('filepath')
-        return Path(filepath) if filepath else None
+        pass
 
     def _finalize_move(self) -> None:
         dest_dir = self.config.output_path

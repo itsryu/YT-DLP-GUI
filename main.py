@@ -12,6 +12,7 @@ import urllib.error
 import time
 import ssl
 import tempfile
+import subprocess
 from dataclasses import dataclass
 from typing import Callable, Final, Dict, Any, Optional, List, TypeVar, Set
 from pathlib import Path
@@ -31,17 +32,51 @@ from PyQt6 import sip
 
 import processamento as proc
 
-# =====================================================================
-# INJEÇÃO DE AMBIENTE SANDBOXED
-# =====================================================================
+
 PROJECT_DIR = str(Path(__file__).parent.absolute())
 if PROJECT_DIR not in os.environ.get("PATH", ""):
     os.environ["PATH"] = f"{PROJECT_DIR};{os.environ.get('PATH', '')}"
-# =====================================================================
 
-# =====================================================================
-# MONKEY PATCH: Transmutador Dinâmico de Exceções e Resolução Heurística
-# =====================================================================
+def _patched_map_ytdlp_to_entity(self: Any, info: dict[str, Any]) -> proc.NormalizedMediaEntity:
+    is_playlist = info.get('_type') == 'playlist' or 'entries' in info
+    canonical_id = info.get('webpage_url') or info.get('url') or info.get('id', '')
+    
+    if is_playlist:
+        children = []
+        for entry in info.get('entries', []):
+            if entry:
+                children.append(_patched_map_ytdlp_to_entity(self, entry))
+        
+        entity = proc.NormalizedMediaEntity(
+            original_id=canonical_id,
+            title=info.get('title', 'Unknown Playlist'),
+            artist=info.get('uploader', 'Unknown'),
+            album=info.get('title', ''),
+            is_playlist=True,
+            children=children,
+            channel=info.get('channel') or info.get('uploader')
+        )
+    else:
+        entity = proc.NormalizedMediaEntity(
+            original_id=canonical_id,
+            title=info.get('title', 'Unknown'),
+            artist=info.get('artist', info.get('uploader', 'Unknown')),
+            album=info.get('album', ''),
+            duration=float(info.get('duration', 0.0) or 0.0),
+            thumbnail_url=info.get('thumbnail'),
+            is_playlist=False,
+            upload_date=info.get('upload_date'),
+            description=info.get('description'),
+            width=info.get('width'),
+            height=info.get('height'),
+            fps=info.get('fps'),
+            channel=info.get('channel') or info.get('uploader')
+        )
+        
+    filesize = info.get('filesize_approx') or info.get('filesize') or 0
+    object.__setattr__(entity, "filesize", filesize)
+    return entity
+
 def _patched_get_filepath(self: Any, info_dict: dict[str, Any]) -> Optional[Path]:
     if info_dict.get('_type') == 'playlist' or 'entries' in info_dict:
         entries = info_dict.get('entries', [])
@@ -62,7 +97,6 @@ def _patched_get_filepath(self: Any, info_dict: dict[str, Any]) -> Optional[Path
         if files:
             files.sort(key=lambda x: x.stat().st_size, reverse=True)
             return files[0]
-            
     return None
 
 def _patched_apply_flags(self: Any, opts: dict[str, Any]) -> None:
@@ -111,10 +145,6 @@ def _patched_worker_run(self: Any) -> None:
     spotify_thumb = getattr(self.config, 'spotify_thumb_url', None)
     if spotify_thumb and not getattr(self.config, 'custom_cover_path', None):
         try:
-            import urllib.request, ssl, uuid, tempfile
-            from pathlib import Path
-            from PyQt6.QtGui import QImage
-            
             ctx = ssl.create_default_context()
             req = urllib.request.Request(spotify_thumb, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req, timeout=10, context=ctx) as response:
@@ -131,17 +161,132 @@ def _patched_worker_run(self: Any) -> None:
             
     _original_run(self)
 
+def _patched_finalize_move(self: Any) -> None:
+    dest_dir = self.config.output_path
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    
+    moved_files = []
+    for file_p in self._temp_dir.iterdir():
+        if file_p.is_file():
+            if self.config.media_type == proc.MediaType.AUDIO:
+                target_ext = f".{self.config.format_container.lower()}"
+                if file_p.suffix.lower() != target_ext and "cover" not in file_p.name.lower():
+                    try: file_p.unlink()
+                    except: pass
+                    continue
+                    
+            target = dest_dir / file_p.name
+            for attempt in range(5):
+                try:
+                    if target.exists(): target.unlink()
+                    import shutil
+                    shutil.move(str(file_p), str(target))
+                    moved_files.append(target)
+                    break
+                except PermissionError as e:
+                    if attempt == 4: raise
+                    import time
+                    time.sleep(1.5)
+                    
+    if moved_files:
+        target_audio = next((f for f in moved_files if f.suffix.lower() == f".{self.config.format_container.lower()}"), moved_files[0])
+        object.__setattr__(self.config, "resolved_output_path", str(target_audio))
+
+    import shutil
+    shutil.rmtree(self._temp_dir, ignore_errors=True)
+
+_original_build_opts = proc.DownloadWorker._build_ydl_opts
+def _patched_build_opts(self: Any) -> dict[str, Any]:
+    opts = _original_build_opts(self)
+    opts['fragment_retries'] = 2
+    opts['retries'] = 2
+    opts['extractor_retries'] = 2
+    opts['file_access_retries'] = 2
+    return opts
+
+proc.AnalysisWorker._map_ytdlp_to_entity = _patched_map_ytdlp_to_entity
 proc.DownloadWorker._get_downloaded_filepath = _patched_get_filepath
 proc.DownloadWorker._apply_raw_custom_flags = _patched_apply_flags
+proc.DownloadWorker._finalize_move = _patched_finalize_move
+proc.DownloadWorker._build_ydl_opts = _patched_build_opts
 proc.DownloadWorker.run = _patched_worker_run
-# =====================================================================
 
 T = TypeVar('T')
 
 APP_NAME: Final[str] = "SoundStream Pro"
-VERSION: Final[str] = "7.4.2"
+VERSION: Final[str] = "7.8.0"
 DEFAULT_DOWNLOAD_DIR: Final[Path] = Path.home() / "Downloads"
 MAX_CONCURRENT_DOWNLOADS: Final[int] = 3
+
+class LocalMetadataEditorDialog(QDialog):
+    def __init__(self, filepath: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.filepath = Path(filepath)
+        self.setWindowTitle("Editor de Metadados Local (FFmpeg)")
+        self.setMinimumSize(450, 200)
+        self._init_ui()
+
+    def _init_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        
+        self.in_title = QLineEdit(self.filepath.stem.split(" - ")[-1] if " - " in self.filepath.stem else self.filepath.stem)
+        self.in_artist = QLineEdit(self.filepath.stem.split(" - ")[0] if " - " in self.filepath.stem else "")
+        self.in_album = QLineEdit()
+        
+        form.addRow("Título:", self.in_title)
+        form.addRow("Artista:", self.in_artist)
+        form.addRow("Álbum:", self.in_album)
+        layout.addLayout(form)
+        
+        lbl_info = QLabel(f"Ficheiro Alvo: {self.filepath.name}\n\nNota: A aplicação reescreverá os metadados através de transcodificação de cópia (Stream Copy). O ficheiro original será substituído de imediato.")
+        lbl_info.setWordWrap(True)
+        lbl_info.setStyleSheet("color: gray; font-size: 11px;")
+        layout.addWidget(lbl_info)
+        
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        btn_box.accepted.connect(self._apply_metadata)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
+
+    def _apply_metadata(self) -> None:
+        if not self.filepath.exists():
+            QMessageBox.critical(self, "Erro I/O", "Ficheiro não localizado no disco.")
+            self.reject()
+            return
+            
+        temp_out = self.filepath.with_suffix(f".temp{self.filepath.suffix}")
+        
+        title = self.in_title.text().replace('"', "'")
+        artist = self.in_artist.text().replace('"', "'")
+        album = self.in_album.text().replace('"', "'")
+        
+        cmd = [
+            "ffmpeg", "-y", "-i", str(self.filepath),
+            "-c", "copy",
+            "-metadata", f"title={title}",
+            "-metadata", f"artist={artist}",
+            "-metadata", f"album={album}",
+            str(temp_out)
+        ]
+        
+        startupinfo = None
+        if os.name == 'nt':
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            
+        try:
+            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True, startupinfo=startupinfo)
+            self.filepath.unlink()
+            os.rename(str(temp_out), str(self.filepath))
+            QMessageBox.information(self, "Sucesso", "Mutações de Metadados aplicadas com sucesso.")
+            self.accept()
+        except subprocess.CalledProcessError as e:
+            if temp_out.exists(): temp_out.unlink()
+            QMessageBox.critical(self, "Falha FFmpeg", f"Não foi possível aplicar os metadados.\n\nDetalhes:\n{e.stderr}")
+        except Exception as e:
+            if temp_out.exists(): temp_out.unlink()
+            QMessageBox.critical(self, "Erro I/O Crítico", str(e))
 
 class DialogThumbnailSignals(QObject):
     ready = pyqtSignal(int, QImage)
@@ -803,9 +948,7 @@ class InspectorPanel(QFrame):
         ffmpeg_layout.addWidget(self.in_ffmpeg_path)
         ffmpeg_layout.addWidget(btn_browse_ffmpeg)
         
-        # INJEÇÃO ESTRITA: Mitigação de HTTP 403 (Forbidden) via supressão do player web.
-        # Desliga o web_player (para evitar JS challenges massivos em HLS) e aponta para TV/Mobile.
-        default_flags = '--extractor-args "youtube:player_client=tv,mweb" --extractor-args "youtube:player_skip=webpage,configs" --match-filter "!is_live & url!*=/shorts/" --force-ipv4'
+        default_flags = '--extractor-args "youtube:player_client=android" --match-filter "!is_live & url!*=/shorts/"'
         self.in_custom_flags = QLineEdit(default_flags, dev_group)
         
         dev_form.addRow("Template de Saída:", tmpl_layout)
@@ -940,7 +1083,11 @@ class InspectorPanel(QFrame):
         if sip.isdeleted(self) or sip.isdeleted(self.in_filename): return
         self._current_meta = meta
         
-        sanitized_title = re.sub(r'[\x00-\x1f\x7f]', '', meta.title)
+        base_filename = meta.title
+        if getattr(meta, 'artist', None) and meta.artist != "Unknown":
+            base_filename = f"{meta.artist} - {meta.title}"
+        
+        sanitized_title = re.sub(r'[\x00-\x1f\x7f]', '', base_filename)
         sanitized_title = re.sub(r'[<>:"/\\|?*]', '', sanitized_title)
         sanitized_title = re.sub(r'\s+', ' ', sanitized_title).strip()
         
@@ -957,23 +1104,24 @@ class InspectorPanel(QFrame):
             
         if not sip.isdeleted(self.in_genre): self.in_genre.clear()
         
-        is_playlist = getattr(meta, 'is_playlist', False)
+        entities = getattr(meta, 'children', []) if getattr(meta, 'is_playlist', False) else []
+        is_batch_operation = len(entities) > 1
         
-        self.tabs.setTabEnabled(1, not is_playlist)
-        if is_playlist:
+        self.tabs.setTabEnabled(1, not is_batch_operation)
+        if is_batch_operation:
             self.tabs.setTabToolTip(1, "Metadados globais bloqueados para transações em lote (Playlists).")
         else:
             self.tabs.setTabToolTip(1, "")
         
         is_audio_restricted = False
         orig_id = getattr(meta, 'original_id', '')
-        if isinstance(orig_id, str) and ('ytmsearch' in orig_id or 'ytsearch' in orig_id or 'music.youtube' in orig_id):
+        if isinstance(orig_id, str) and ('ytmsearch' in orig_id or 'ytsearch' in orig_id or 'music.youtube' in orig_id or 'soundcloud' in orig_id):
             is_audio_restricted = True
             
         if getattr(meta, 'children', None):
             for c in meta.children:
                 c_id = getattr(c, 'original_id', '')
-                if isinstance(c_id, str) and ('ytmsearch' in c_id or 'ytsearch' in c_id or 'music.youtube' in c_id):
+                if isinstance(c_id, str) and ('ytmsearch' in c_id or 'ytsearch' in c_id or 'music.youtube' in c_id or 'soundcloud' in c_id):
                     is_audio_restricted = True
                     break
 
@@ -1036,20 +1184,40 @@ class InspectorPanel(QFrame):
     def _recalc_estimate(self) -> None:
         if sip.isdeleted(self) or sip.isdeleted(self.stats_lbl) or not self._current_meta: return
         
-        origem_texto = "Desconhecida (Áudio/DRM)"
-        if getattr(self._current_meta, 'width', None) and getattr(self._current_meta, 'height', None):
-            origem_texto = f"{self._current_meta.width}x{self._current_meta.height} @ {getattr(self._current_meta, 'fps', 'N/A')}fps"
-
-        canal_formatado = getattr(self._current_meta, 'channel', "N/A")
-        if not canal_formatado:
-            canal_formatado = "N/A"
+        meta = self._current_meta
         
-        base_info = (
-            f"<b>Duração:</b> {getattr(self._current_meta, 'display_duration', 'N/A')}<br>"
-            f"<b>Origem:</b> {origem_texto}<br>"
-            f"<b>Canal:</b> {canal_formatado}"
-        )
-        self.stats_lbl.setText(base_info)
+        orig_id = getattr(meta, 'original_id', '')
+        is_spotify_ytm = getattr(meta, 'is_search_query', False) or "spotify" in orig_id or "music.youtube" in orig_id
+        is_soundcloud = "soundcloud.com" in orig_id
+        is_video = getattr(meta, 'width', None) is not None
+
+        html_parts = [f"<b>Duração:</b> {getattr(meta, 'display_duration', 'N/A')}"]
+        
+        filesize = getattr(meta, 'filesize', 0)
+        if filesize and filesize > 0:
+            size_mb = filesize / (1024 * 1024)
+            html_parts.append(f"<b>Tamanho Estimado:</b> {size_mb:.2f} MB")
+
+        if is_spotify_ytm:
+            album = getattr(meta, 'album', '') or 'Singles/Desconhecido'
+            date = getattr(meta, 'upload_date', '') or 'N/A'
+            html_parts.append(f"<b>Álbum:</b> {album}")
+            html_parts.append(f"<b>Lançamento:</b> {date}")
+            html_parts.append("<b>Topologia:</b> Fonograma Master (DRM/Áudio)")
+        elif is_soundcloud:
+            canal = getattr(meta, 'channel', '') or getattr(meta, 'artist', 'Desconhecido')
+            html_parts.append(f"<b>Uploader (SC):</b> {canal}")
+            html_parts.append("<b>Topologia:</b> Áudio de Plataforma Fechada")
+        elif is_video:
+            res = f"{meta.width}x{meta.height} @ {getattr(meta, 'fps', 'N/A')}fps"
+            canal = getattr(meta, 'channel', '') or 'Desconhecido'
+            html_parts.append(f"<b>Matriz de Vídeo:</b> {res}")
+            html_parts.append(f"<b>Canal (YT):</b> {canal}")
+        else:
+            canal = getattr(meta, 'channel', '') or 'Desconhecido'
+            html_parts.append(f"<b>Canal:</b> {canal}")
+
+        self.stats_lbl.setText("<br>".join(html_parts))
 
     def get_config_delta(self) -> Dict[str, Any]:
         if sip.isdeleted(self) or sip.isdeleted(self.tabs):
@@ -1275,6 +1443,7 @@ class MainWindow(QMainWindow):
         header_view = self.table.horizontalHeader()
         if header_view is not None:
             header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            header_view.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_context_menu)
@@ -1303,6 +1472,12 @@ class MainWindow(QMainWindow):
             cell_item = self.table.item(row, 0)
             if cell_item is not None:
                 job_id = cell_item.data(Qt.ItemDataRole.UserRole)
+                status_item = self.table.item(row, 2)
+                
+                if status_item and "Concluído" in status_item.text():
+                    action_edit_meta = QAction("Editar Metadados Localmente", self)
+                    action_edit_meta.triggered.connect(lambda _, jid=job_id: self._edit_local_metadata(jid))
+                    menu.addAction(action_edit_meta)
                 
                 action_remove = QAction("Remover da Fila", self)
                 action_remove.triggered.connect(lambda _, jid=job_id: self._remove_from_queue(jid))
@@ -1313,7 +1488,6 @@ class MainWindow(QMainWindow):
                     action_cancel.triggered.connect(lambda _, jid=job_id: self.cancel_job(jid))
                     menu.addAction(action_cancel)
                 else:
-                    status_item = self.table.item(row, 2)
                     if status_item and ("Erro" in status_item.text() or "Cancelado" in status_item.text()):
                         action_retry = QAction("Tentar Novamente", self)
                         action_retry.triggered.connect(lambda _, jid=job_id: self.retry_job(jid))
@@ -1332,6 +1506,19 @@ class MainWindow(QMainWindow):
         viewport = self.table.viewport()
         if viewport is not None:
             menu.exec(viewport.mapToGlobal(pos))
+
+    def _edit_local_metadata(self, job_id: str) -> None:
+        config = self.job_configs.get(job_id)
+        if not config: return
+        
+        filepath = getattr(config, 'resolved_output_path', None)
+        
+        if not filepath or not Path(filepath).exists():
+            QMessageBox.warning(self, "Aviso", f"O ficheiro físico não se encontra no destino indexado:\n{filepath}")
+            return
+            
+        dialog = LocalMetadataEditorDialog(str(filepath), self)
+        dialog.exec()
 
     def _remove_from_queue(self, job_id: str) -> None:
         if job_id in self.active_runnables:
@@ -1444,8 +1631,7 @@ class MainWindow(QMainWindow):
             job_id = str(uuid.uuid4())
             target_url = str(getattr(entity, 'original_id', ''))
             
-            # Operador Lógico Expandido: Bloqueia HLS/Vídeo em links Singulares do YT Music
-            is_audio_centric = getattr(entity, 'is_search_query', False) or "music.youtube" in target_url or "spotify" in target_url
+            is_audio_centric = getattr(entity, 'is_search_query', False) or "music.youtube" in target_url or "spotify" in target_url or "soundcloud" in target_url
             
             current_media_type = data['media_type']
             current_format = data['format_container']
@@ -1466,6 +1652,8 @@ class MainWindow(QMainWindow):
             if getattr(self._current_meta, 'is_playlist', False):
                 safe_title = re.sub(r'[<>:"/\\|?*]', '', f"{entity.artist} - {entity.title}")
                 resolved_filename = safe_title.strip()
+            else:
+                resolved_filename = re.sub(r'[<>:"/\\|?*]', '', resolved_filename).strip()
 
             config = proc.DownloadJobConfig(
                 job_id=job_id,
@@ -1621,8 +1809,6 @@ class MainWindow(QMainWindow):
     def on_job_finished(self, job_id: str) -> None:
         if sip.isdeleted(self): return
         if job_id in self._terminal_jobs: return
-        if job_id in self.job_configs:
-            del self.job_configs[job_id]
         self._cleanup_job(job_id, "✔ Concluído", QColor("#4caf50"))
 
     def on_job_error(self, job_id: str, err: str) -> None:
@@ -1669,7 +1855,8 @@ class MainWindow(QMainWindow):
                 if isinstance(widget, QProgressBar):
                     widget.setValue(0)
                 
-                btn_retry = QPushButton("Tentar Novamente")
+                btn_retry = QPushButton("Repetir")
+                btn_retry.setMinimumWidth(110)
                 btn_retry.setObjectName("PrimaryAction")
                 btn_retry.clicked.connect(lambda _, jid=job_id: self.retry_job(jid))
                 
