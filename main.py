@@ -31,17 +31,10 @@ from PyQt6 import sip
 
 import processamento as proc
 
-# =====================================================================
-# INJEÇÃO DE AMBIENTE SANDBOXED
-# =====================================================================
 PROJECT_DIR = str(Path(__file__).parent.absolute())
 if PROJECT_DIR not in os.environ.get("PATH", ""):
     os.environ["PATH"] = f"{PROJECT_DIR};{os.environ.get('PATH', '')}"
-# =====================================================================
 
-# =====================================================================
-# MONKEY PATCH: Transmutador Dinâmico de Exceções e Resolução Heurística
-# =====================================================================
 def _patched_get_filepath(self: Any, info_dict: dict[str, Any]) -> Optional[Path]:
     if info_dict.get('_type') == 'playlist' or 'entries' in info_dict:
         entries = info_dict.get('entries', [])
