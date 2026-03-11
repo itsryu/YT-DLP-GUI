@@ -32,11 +32,17 @@ from PyQt6 import sip
 
 import processamento as proc
 
-
+# =====================================================================
+# INJEÇÃO DE AMBIENTE SANDBOXED
+# =====================================================================
 PROJECT_DIR = str(Path(__file__).parent.absolute())
 if PROJECT_DIR not in os.environ.get("PATH", ""):
     os.environ["PATH"] = f"{PROJECT_DIR};{os.environ.get('PATH', '')}"
+# =====================================================================
 
+# =====================================================================
+# MONKEY PATCHES: Manipulação de AST e Resiliência I/O
+# =====================================================================
 def _patched_map_ytdlp_to_entity(self: Any, info: dict[str, Any]) -> proc.NormalizedMediaEntity:
     is_playlist = info.get('_type') == 'playlist' or 'entries' in info
     canonical_id = info.get('webpage_url') or info.get('url') or info.get('id', '')
@@ -97,6 +103,7 @@ def _patched_get_filepath(self: Any, info_dict: dict[str, Any]) -> Optional[Path
         if files:
             files.sort(key=lambda x: x.stat().st_size, reverse=True)
             return files[0]
+            
     return None
 
 def _patched_apply_flags(self: Any, opts: dict[str, Any]) -> None:
@@ -160,6 +167,18 @@ def _patched_worker_run(self: Any) -> None:
             self._logger.warning(f"Injeção assíncrona de miniatura Spotify abortada: {e}")
             
     _original_run(self)
+    
+    try:
+        final_name = f"{self.config.custom_filename}.{self.config.format_container}"
+        target_path = self.config.output_path / final_name
+        if target_path.exists():
+            object.__setattr__(self.config, "resolved_output_path", str(target_path))
+        else:
+            files = list(self.config.output_path.glob(f"{self.config.custom_filename}.*"))
+            if files:
+                object.__setattr__(self.config, "resolved_output_path", str(files[0]))
+    except Exception:
+        pass
 
 def _patched_finalize_move(self: Any) -> None:
     dest_dir = self.config.output_path
@@ -195,6 +214,23 @@ def _patched_finalize_move(self: Any) -> None:
     import shutil
     shutil.rmtree(self._temp_dir, ignore_errors=True)
 
+_original_execute_audio_pipeline = proc.SubprocessDSPEngine.execute_audio_pipeline
+def _patched_execute_audio_pipeline(config: proc.DownloadJobConfig, raw_filepath: Path, info_dict: dict[str, Any], temp_dir: Path, logger: logging.Logger) -> None:
+    """ 
+    Interceptador de Contrato de E/S (I/O). 
+    Captura explicitamente a anomalia WinError 2 do módulo nativo subprocess.
+    """
+    try:
+        _original_execute_audio_pipeline(config, raw_filepath, info_dict, temp_dir, logger)
+    except FileNotFoundError as e:
+        logger.error(f"Dependência C/C++ ausente (FFmpeg): {e}")
+        raise RuntimeError(
+            "Motor DSP (FFmpeg) não foi localizado no sistema.\n\n"
+            "Para possibilitar a conversão atómica de ficheiros e a injeção de metadados, "
+            "é imperativo instalar o executável FFmpeg e averbar a sua diretoria ao 'PATH' do Windows, "
+            "ou fornecer o caminho absoluto na aba 'Configuração Avançada'."
+        )
+
 _original_build_opts = proc.DownloadWorker._build_ydl_opts
 def _patched_build_opts(self: Any) -> dict[str, Any]:
     opts = _original_build_opts(self)
@@ -204,17 +240,19 @@ def _patched_build_opts(self: Any) -> dict[str, Any]:
     opts['file_access_retries'] = 2
     return opts
 
+proc.SubprocessDSPEngine.execute_audio_pipeline = _patched_execute_audio_pipeline
 proc.AnalysisWorker._map_ytdlp_to_entity = _patched_map_ytdlp_to_entity
 proc.DownloadWorker._get_downloaded_filepath = _patched_get_filepath
 proc.DownloadWorker._apply_raw_custom_flags = _patched_apply_flags
 proc.DownloadWorker._finalize_move = _patched_finalize_move
 proc.DownloadWorker._build_ydl_opts = _patched_build_opts
 proc.DownloadWorker.run = _patched_worker_run
+# =====================================================================
 
 T = TypeVar('T')
 
 APP_NAME: Final[str] = "SoundStream Pro"
-VERSION: Final[str] = "7.8.0"
+VERSION: Final[str] = "7.10.0"
 DEFAULT_DOWNLOAD_DIR: Final[Path] = Path.home() / "Downloads"
 MAX_CONCURRENT_DOWNLOADS: Final[int] = 3
 
@@ -766,6 +804,7 @@ class InspectorPanel(QFrame):
         super().__init__(parent)
         self.setObjectName("Panel")
         self._current_meta: Optional[proc.NormalizedMediaEntity] = None
+        self._current_source_url: str = ""
         self._init_ui()
 
     def _init_ui(self) -> None:
@@ -1113,15 +1152,20 @@ class InspectorPanel(QFrame):
         else:
             self.tabs.setTabToolTip(1, "")
         
+        # Bloqueio de Áudio Semântico: Impede transferência de vídeos em plataformas fonográficas.
         is_audio_restricted = False
-        orig_id = getattr(meta, 'original_id', '')
-        if isinstance(orig_id, str) and ('ytmsearch' in orig_id or 'ytsearch' in orig_id or 'music.youtube' in orig_id or 'soundcloud' in orig_id):
+        orig_id = getattr(meta, 'original_id', '').lower()
+        source_url = getattr(self, '_current_source_url', '').lower()
+        
+        audio_triggers = ['ytmsearch', 'ytsearch', 'music.youtube', 'soundcloud', 'spotify']
+        
+        if any(trigger in orig_id for trigger in audio_triggers) or any(trigger in source_url for trigger in audio_triggers):
             is_audio_restricted = True
             
         if getattr(meta, 'children', None):
             for c in meta.children:
-                c_id = getattr(c, 'original_id', '')
-                if isinstance(c_id, str) and ('ytmsearch' in c_id or 'ytsearch' in c_id or 'music.youtube' in c_id or 'soundcloud' in c_id):
+                c_id = getattr(c, 'original_id', '').lower()
+                if any(trigger in c_id for trigger in audio_triggers):
                     is_audio_restricted = True
                     break
 
@@ -1187,8 +1231,10 @@ class InspectorPanel(QFrame):
         meta = self._current_meta
         
         orig_id = getattr(meta, 'original_id', '')
-        is_spotify_ytm = getattr(meta, 'is_search_query', False) or "spotify" in orig_id or "music.youtube" in orig_id
-        is_soundcloud = "soundcloud.com" in orig_id
+        source_url = getattr(self, '_current_source_url', '').lower()
+        
+        is_spotify_ytm = getattr(meta, 'is_search_query', False) or "spotify" in orig_id or "music.youtube" in orig_id or "spotify" in source_url or "music.youtube" in source_url
+        is_soundcloud = "soundcloud.com" in orig_id or "soundcloud" in source_url
         is_video = getattr(meta, 'width', None) is not None
 
         html_parts = [f"<b>Duração:</b> {getattr(meta, 'display_duration', 'N/A')}"]
@@ -1555,6 +1601,8 @@ class MainWindow(QMainWindow):
         
         if not sip.isdeleted(self.inspector):
             self.inspector.clear_thumbnail()
+            
+        self.inspector._current_source_url = url
         
         self.btn_analyze.setEnabled(False)
         self.btn_analyze.setText("A processar...")
@@ -1631,7 +1679,8 @@ class MainWindow(QMainWindow):
             job_id = str(uuid.uuid4())
             target_url = str(getattr(entity, 'original_id', ''))
             
-            is_audio_centric = getattr(entity, 'is_search_query', False) or "music.youtube" in target_url or "spotify" in target_url or "soundcloud" in target_url
+            source_url = getattr(self.inspector, '_current_source_url', '')
+            is_audio_centric = getattr(entity, 'is_search_query', False) or "music.youtube" in target_url or "spotify" in target_url or "soundcloud" in target_url or "music.youtube" in source_url or "spotify" in source_url or "soundcloud" in source_url
             
             current_media_type = data['media_type']
             current_format = data['format_container']
