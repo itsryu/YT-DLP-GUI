@@ -32,17 +32,11 @@ from PyQt6 import sip
 
 import processamento as proc
 
-# =====================================================================
-# INJEÇÃO DE AMBIENTE SANDBOXED
-# =====================================================================
+
 PROJECT_DIR = str(Path(__file__).parent.absolute())
 if PROJECT_DIR not in os.environ.get("PATH", ""):
     os.environ["PATH"] = f"{PROJECT_DIR};{os.environ.get('PATH', '')}"
-# =====================================================================
 
-# =====================================================================
-# MONKEY PATCHES: Manipulação de AST e Resiliência I/O
-# =====================================================================
 def _patched_map_ytdlp_to_entity(self: Any, info: dict[str, Any]) -> proc.NormalizedMediaEntity:
     is_playlist = info.get('_type') == 'playlist' or 'entries' in info
     canonical_id = info.get('webpage_url') or info.get('url') or info.get('id', '')
@@ -216,10 +210,6 @@ def _patched_finalize_move(self: Any) -> None:
 
 _original_execute_audio_pipeline = proc.SubprocessDSPEngine.execute_audio_pipeline
 def _patched_execute_audio_pipeline(config: proc.DownloadJobConfig, raw_filepath: Path, info_dict: dict[str, Any], temp_dir: Path, logger: logging.Logger) -> None:
-    """ 
-    Interceptador de Contrato de E/S (I/O). 
-    Captura explicitamente a anomalia WinError 2 do módulo nativo subprocess.
-    """
     try:
         _original_execute_audio_pipeline(config, raw_filepath, info_dict, temp_dir, logger)
     except FileNotFoundError as e:
@@ -247,7 +237,6 @@ proc.DownloadWorker._apply_raw_custom_flags = _patched_apply_flags
 proc.DownloadWorker._finalize_move = _patched_finalize_move
 proc.DownloadWorker._build_ydl_opts = _patched_build_opts
 proc.DownloadWorker.run = _patched_worker_run
-# =====================================================================
 
 T = TypeVar('T')
 
@@ -1152,7 +1141,6 @@ class InspectorPanel(QFrame):
         else:
             self.tabs.setTabToolTip(1, "")
         
-        # Bloqueio de Áudio Semântico: Impede transferência de vídeos em plataformas fonográficas.
         is_audio_restricted = False
         orig_id = getattr(meta, 'original_id', '').lower()
         source_url = getattr(self, '_current_source_url', '').lower()
