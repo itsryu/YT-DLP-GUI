@@ -4,3 +4,4 @@ mutagen
 requests
 aiohttp
 spotipy
+curl_cffi

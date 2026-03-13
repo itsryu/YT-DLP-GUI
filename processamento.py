@@ -1,23 +1,34 @@
+from ast import TypeVar
+from functools import wraps
 import logging
 import os
+import random
 import re
 import shlex
 import shutil
 import ssl
 import subprocess
 import threading
+import time
 import urllib.request
 import uuid
 import http.client
+import importlib.util
+import tempfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import Optional, Any, TypedDict, Dict, List, cast
+from typing import Callable, Optional, Any, TypedDict, Dict, List, cast
+
+HAS_CURL_CFFI = importlib.util.find_spec("curl_cffi") is not None
+if not HAS_CURL_CFFI:
+    logging.getLogger(__name__).warning("[Dependência] O módulo 'curl_cffi' não foi detetado. A ofuscação de assinatura TLS (impersonate) operará em modo degradado.")
 
 try:
     import yt_dlp  # type: ignore
     from yt_dlp.utils import DownloadError  # type: ignore
+    from yt_dlp.networking.impersonate import ImpersonateTarget # type: ignore
 except ImportError as e:
     raise ImportError(f"CRITICAL: Dependência yt-dlp não resolvida. {e}")
 
@@ -28,6 +39,7 @@ except ImportError as e:
     raise ImportError(f"CRITICAL: Dependência spotipy não resolvida. {e}")
 
 from PyQt6.QtCore import QObject, pyqtSignal, QRunnable, pyqtSlot, QThreadPool
+from PyQt6.QtGui import QImage
 
 class MediaType(Enum):
     AUDIO = auto()
@@ -50,6 +62,7 @@ class NormalizedMediaEntity:
     height: Optional[int] = None
     fps: Optional[float] = None
     channel: Optional[str] = None
+    filesize: int = 0
 
     @property
     def display_duration(self) -> str:
@@ -102,6 +115,9 @@ class DownloadJobConfig:
     embed_subs: bool = False
     normalize_audio: bool = False
     use_browser_cookies: bool = False
+    
+    spotify_thumb_url: Optional[str] = None
+    resolved_output_path: Optional[str] = None
 
 class YtDlpExtractedInfo(TypedDict, total=False):
     id: str
@@ -124,6 +140,8 @@ class YtDlpExtractedInfo(TypedDict, total=False):
     comment: str
     entries: List['YtDlpExtractedInfo']
     _type: str
+    filesize: int
+    filesize_approx: int
 
 class IMessageBroker(ABC):
     @abstractmethod
@@ -281,6 +299,63 @@ class SpotifyToYTMAdapter:
         if not match:
             raise ValueError(f"URL corrompida: Falha na extração de hash de {entity_type}.")
         return match.group(1)
+    
+T = TypeVar('T')
+
+def exponential_backoff(retries: int = 3, base_delay: float = 2.0, max_delay: float = 30.0) -> Callable:
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> T:
+            attempt = 0
+            while attempt < retries:
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if "WAF" not in str(e) and "reload" not in str(e).lower() and attempt == retries - 1:
+                        raise e
+                    
+                    attempt += 1
+                    delay = min(max_delay, base_delay * (2 ** attempt))
+                    jitter = random.uniform(0, delay)
+                    
+                    logging.warning(f"[Network] Interceptação detetada. Retentativa {attempt}/{retries} acionada em {jitter:.2f}s. Erro: {e}")
+                    time.sleep(jitter)
+            raise RuntimeError(f"Exaustão da malha de rede após {retries} tentativas. Última falha: {e}")
+        return wrapper
+    return decorator
+
+class SessionStateManager:
+    @staticmethod
+    def create_ephemeral_cookie_jar() -> Optional[str]:
+        central_cookie = Path("cookies.txt")
+        if not central_cookie.exists():
+            return None
+            
+        try:
+            fd, temp_path = tempfile.mkstemp(suffix=".txt", prefix="sndstream_session_")
+            os.close(fd)
+            
+            for attempt in range(5):
+                try:
+                    shutil.copy2(central_cookie, temp_path)
+                    return temp_path
+                except (PermissionError, OSError):
+                    if attempt == 4:
+                        logging.getLogger(__name__).warning("[I/O] Mutex Lock irrecuperável na matriz de cookies. Operação prosseguirá em modo stateless.")
+                        return None
+                    time.sleep(0.5 * (1.5 ** attempt))
+            return None
+        except Exception as e:
+            logging.getLogger(__name__).error(f"[I/O] Colapso na alocação de Sandbox para sessão: {e}")
+            return None
+
+    @staticmethod
+    def cleanup_ephemeral_cookie_jar(path: Optional[str]) -> None:
+        if path and os.path.exists(path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 class YtDlpService:
     URL_REGEX = re.compile(
@@ -293,40 +368,52 @@ class YtDlpService:
         return bool(YtDlpService.URL_REGEX.match(url))
 
     @classmethod
+    @exponential_backoff(retries=3)
     def extract_info_sync(cls, url: str) -> YtDlpExtractedInfo:
-        logging.debug(f"[Network] Semáforo de rede adquirido: {url}")
+        logging.debug(f"[Network] Semáforo de rede adquirido (AST Pre-flight): {url}")
+        
+        ydl_opts_base: Dict[str, Any] = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': 'in_playlist',
+            'socket_timeout': 15,
+            'logger': logging.getLogger('yt_dlp_internal'),
+            'remote_components': ['ejs:github'],
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'ios', 'mweb', 'web'],
+                    'player_skip': ['web_embedded', 'tv']
+                }
+            },
+            'javascript_executor': 'deno',
+        }
+
+        if HAS_CURL_CFFI:
+            ydl_opts_base['impersonate'] = ImpersonateTarget(client='chrome')
+
         with cls._network_semaphore:
-            ydl_opts: Dict[str, Any] = {
-                'quiet': True,
-                'no_warnings': True,
-                'extract_flat': 'in_playlist',
-                'socket_timeout': 15,
-                'logger': logging.getLogger('yt_dlp_internal'),
-                'remote_components': ['ejs:github'],
-                'extractor_args': {
-                    'youtube': ['player_client=ios,android,mweb', 'player_skip=configs']
-                },
-            }
-            
-            cookie_file = Path("cookies.txt")
-            if cookie_file.exists() and cookie_file.is_file():
-                ydl_opts['cookiefile'] = str(cookie_file)
-            
             try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
+                with yt_dlp.YoutubeDL(ydl_opts_base) as ydl:
+                    return cast(YtDlpExtractedInfo, ydl.extract_info(url, download=False))
             except DownloadError as e:
                 error_msg = str(e).lower()
-                if "sign in to confirm" in error_msg or "bot" in error_msg:
-                    msg = (
-                        "Interceção WAF (YouTube Anti-Bot).\n"
-                        "Mitigação requerida: Injete cookies válidos ('cookies.txt') no diretório raiz."
-                    )
-                    logging.critical(f"[Security] WAF Triggered. {msg}")
-                    raise RuntimeError(msg)
-                raise
-
-            return cast(YtDlpExtractedInfo, info)
+                if any(kw in error_msg for kw in ["sign in", "members only", "private", "age", "bot", "reloaded"]):
+                    logging.info("[Security] Restrição ACL ou WAF detetada. Executando degradação via injeção de Estado (Cookies).")
+                    
+                    ephemeral_cookie = SessionStateManager.create_ephemeral_cookie_jar()
+                    if not ephemeral_cookie:
+                        raise e 
+                        
+                    ydl_opts_fallback = ydl_opts_base.copy()
+                    ydl_opts_fallback['cookiefile'] = ephemeral_cookie
+                    
+                    try:
+                        with yt_dlp.YoutubeDL(ydl_opts_fallback) as ydl_fallback:
+                            return cast(YtDlpExtractedInfo, ydl_fallback.extract_info(url, download=False))
+                    finally:
+                        SessionStateManager.cleanup_ephemeral_cookie_jar(ephemeral_cookie)
+                else:
+                    raise
 
     @classmethod
     def fetch_thumbnail_bytes_sync(cls, url: str) -> Optional[bytes]:
@@ -390,33 +477,27 @@ class AnalysisWorker(QRunnable):
         finally:
             self.broker.emit_finished()
 
-    def _map_ytdlp_to_entity(self, info: YtDlpExtractedInfo) -> NormalizedMediaEntity:
+    def _map_ytdlp_to_entity(self, info: Dict[str, Any]) -> NormalizedMediaEntity:
         is_playlist = info.get('_type') == 'playlist' or 'entries' in info
-        
         canonical_id = info.get('webpage_url') or info.get('url') or info.get('id', '')
         
         if is_playlist:
-            children: List[NormalizedMediaEntity] = []
+            children = []
             for entry in info.get('entries', []):
                 if entry:
                     children.append(self._map_ytdlp_to_entity(entry))
             
-            return NormalizedMediaEntity(
+            entity = NormalizedMediaEntity(
                 original_id=canonical_id,
                 title=info.get('title', 'Unknown Playlist'),
                 artist=info.get('uploader', 'Unknown'),
                 album=info.get('title', ''),
                 is_playlist=True,
                 children=children,
-                upload_date=None,
-                description=None,
-                width=None,
-                height=None,
-                fps=None,
                 channel=info.get('channel') or info.get('uploader')
             )
         else:
-            return NormalizedMediaEntity(
+            entity = NormalizedMediaEntity(
                 original_id=canonical_id,
                 title=info.get('title', 'Unknown'),
                 artist=info.get('artist', info.get('uploader', 'Unknown')),
@@ -431,6 +512,10 @@ class AnalysisWorker(QRunnable):
                 fps=info.get('fps'),
                 channel=info.get('channel') or info.get('uploader')
             )
+            
+        filesize = info.get('filesize_approx') or info.get('filesize') or 0
+        object.__setattr__(entity, "filesize", filesize)
+        return entity
 
 class PlaylistDispatcher:
     def __init__(self, thread_pool: QThreadPool) -> None:
@@ -476,7 +561,8 @@ class PlaylistDispatcher:
             meta_desc=entity.description if entity.description else base_config.meta_desc,
             embed_metadata=base_config.embed_metadata,
             embed_thumbnail=base_config.embed_thumbnail,
-            normalize_audio=base_config.normalize_audio
+            normalize_audio=base_config.normalize_audio,
+            use_browser_cookies=base_config.use_browser_cookies
         )
 
         worker = DownloadWorker(thread_safe_config)
@@ -595,6 +681,14 @@ class SubprocessDSPEngine:
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True, startupinfo=startupinfo)
+        except FileNotFoundError as e:
+            logger.error(f"Dependência C/C++ ausente (FFmpeg): {e}")
+            raise RuntimeError(
+                "Motor DSP (FFmpeg) não foi localizado no sistema.\n\n"
+                "Para possibilitar a conversão atómica de ficheiros e a injeção de metadados, "
+                "é imperativo instalar o executável FFmpeg e averbar a sua diretoria ao 'PATH' do Windows, "
+                "ou fornecer o caminho absoluto na aba 'Configuração Avançada'."
+            )
         except subprocess.CalledProcessError as e:
             logger.error(f"Kernel Panic em Subprocesso DSP: {e.stderr}")
             raise RuntimeError(f"FFmpeg falhou ao processar matriz de áudio: {e.stderr}")
@@ -618,6 +712,7 @@ class DownloadWorker(QRunnable):
         self._is_cancelled = False
         self._temp_dir: Path = self.config.output_path / ".inprogress" / self.config.job_id
         self._logger = logging.getLogger(f"Job_{self.config.job_id[:8]}")
+        self._ephemeral_cookie: Optional[str] = None
 
     @property
     def signals(self) -> WorkerSignals:
@@ -651,34 +746,47 @@ class DownloadWorker(QRunnable):
         self._temp_dir.mkdir(parents=True, exist_ok=True)
         filename_tmpl = self.config.output_template if self.config.output_template else f"{self.config.custom_filename}.%(ext)s"
         out_tmpl = str(self._temp_dir / filename_tmpl)
-        
+
+        current_dir = str(Path.cwd().absolute())
+        if current_dir not in os.environ["PATH"]:
+            os.environ["PATH"] = f"{current_dir}{os.pathsep}{os.environ['PATH']}"
+
         opts: dict[str, Any] = {
             'outtmpl': out_tmpl,
             'progress_hooks': [self._progress_hook],
             'quiet': True,
-            'no_warnings': True,
-            'ignoreerrors': False,
-            'retries': 10,
-            'fragment_retries': 10,
-            'socket_timeout': 15,
+            'no_warnings': False,
+            'socket_timeout': 30,
             'logger': YtDlpInterceptorLogger(self.config.job_id, self._check_abort),
+            'javascript_executor': 'deno',
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'ios', 'mweb', 'web'],
+                    'player_skip': ['web_embedded', 'tv'],
+                    'include_live_chat': False,
+                }
+            },
+            'youtube_include_dash_manifest': True, 
             'postprocessors': [],
             'postprocessor_args': {},
             'remote_components': ['ejs:github'],
-            'extractor_args': {
-                'youtube': ['player_client=ios,android,mweb', 'player_skip=configs']
-            }
         }
 
-        if self.config.ffmpeg_path: opts['ffmpeg_location'] = self.config.ffmpeg_path
+        if HAS_CURL_CFFI:
+            opts['impersonate'] = ImpersonateTarget(client='chrome')
+
+        if self.config.ffmpeg_path:
+            opts['ffmpeg_location'] = self.config.ffmpeg_path
         
-        cookie_file = Path("cookies.txt")
-        if cookie_file.exists() and cookie_file.is_file():
-            opts['cookiefile'] = str(cookie_file)
+        if self.config.use_browser_cookies:
+            self._ephemeral_cookie = SessionStateManager.create_ephemeral_cookie_jar()
+            if self._ephemeral_cookie:
+                opts['cookiefile'] = self._ephemeral_cookie
 
         self._configure_format_opts(opts)
         self._configure_metadata_opts(opts)
         self._apply_raw_custom_flags(opts)
+        
         return opts
 
     def _configure_format_opts(self, opts: dict[str, Any]) -> None:
@@ -742,23 +850,86 @@ class DownloadWorker(QRunnable):
             opts['writesubtitles'] = True
 
     def _apply_raw_custom_flags(self, opts: dict[str, Any]) -> None:
-        pass
+        if not self.config.custom_flags: return
+        try:
+            from yt_dlp.utils import match_filter_func
+            tokens = shlex.split(self.config.custom_flags)
+            i = 0
+            while i < len(tokens):
+                flag = tokens[i]
+                if flag.startswith('--'):
+                    key = flag[2:].replace('-', '_')
+                    if i + 1 < len(tokens) and not tokens[i+1].startswith('--'):
+                        val = tokens[i+1]
+                        i += 2
+                        
+                        if key == 'extractor_args' and ':' in val and '=' in val:
+                            extractor, rest = val.split(':', 1)
+                            arg_k, arg_v = rest.split('=', 1)
+                            
+                            ext_dict = opts.setdefault('extractor_args', {})
+                            if not isinstance(ext_dict, dict):
+                                ext_dict = {}
+                                opts['extractor_args'] = ext_dict
+                                
+                            ext_args = ext_dict.setdefault(extractor, {})
+                            if isinstance(ext_args, list):
+                                ext_args.append(f"{arg_k}={arg_v}")
+                            elif isinstance(ext_args, dict):
+                                ext_args.setdefault(arg_k, []).append(arg_v)
+                        elif key == 'match_filter':
+                            opts[key] = match_filter_func(val)
+                        else: 
+                            opts[key] = val
+                    else:
+                        opts[key] = True
+                        i += 1
+                else: i += 1
+        except Exception as e:
+            self._logger.error(f"Erro Léxico em Abstract Syntax Tree (Flags Customizadas): {e}")
 
     def _get_downloaded_filepath(self, info_dict: dict[str, Any]) -> Optional[Path]:
-        pass
+        if info_dict.get('_type') == 'playlist' or 'entries' in info_dict:
+            entries = info_dict.get('entries', [])
+            if entries:
+                info_dict = entries[0]
+                
+        req_dl = info_dict.get('requested_downloads')
+        if req_dl and isinstance(req_dl, list):
+            filepath = req_dl[0].get('filepath') or req_dl[0].get('_filename')
+            if filepath: return Path(filepath)
+            
+        filepath = info_dict.get('filepath') or info_dict.get('_filename')
+        if filepath: return Path(filepath)
+        
+        if self._temp_dir and self._temp_dir.exists():
+            files = [f for f in self._temp_dir.iterdir() if f.is_file() and not f.name.endswith('.part') and not f.name.endswith('.ytdl')]
+            if files:
+                files.sort(key=lambda x: x.stat().st_size, reverse=True)
+                return files[0]
+                
+        return None
 
     def _finalize_move(self) -> None:
         dest_dir = self.config.output_path
         dest_dir.mkdir(parents=True, exist_ok=True)
         
+        moved_files = []
         for file_p in self._temp_dir.iterdir():
             if file_p.is_file():
+                if self.config.media_type == MediaType.AUDIO:
+                    target_ext = f".{self.config.format_container.lower()}"
+                    if file_p.suffix.lower() != target_ext and "cover" not in file_p.name.lower():
+                        try: file_p.unlink()
+                        except: pass
+                        continue
+                        
                 target = dest_dir / file_p.name
-                
                 for attempt in range(5):
                     try:
                         if target.exists(): target.unlink()
                         shutil.move(str(file_p), str(target))
+                        moved_files.append(target)
                         break
                     except PermissionError as e:
                         if attempt == 4:
@@ -766,12 +937,35 @@ class DownloadWorker(QRunnable):
                             raise
                         import time
                         time.sleep(1.5)
+                        
+        if moved_files:
+            target_audio = next((f for f in moved_files if f.suffix.lower() == f".{self.config.format_container.lower()}"), moved_files[0])
+            object.__setattr__(self.config, "resolved_output_path", str(target_audio))
 
         shutil.rmtree(self._temp_dir, ignore_errors=True)
 
     @pyqtSlot()
     def run(self) -> None:
         self.broker.emit_status(self.config.job_id, "Aquisição de Socket...")
+        
+        spotify_thumb = getattr(self.config, 'spotify_thumb_url', None)
+        if spotify_thumb and not getattr(self.config, 'custom_cover_path', None):
+            try:
+                from PyQt6.QtGui import QImage
+                ctx = ssl.create_default_context()
+                req = urllib.request.Request(spotify_thumb, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=10, context=ctx) as response:
+                    buffer = response.read()
+                
+                image = QImage()
+                if image.loadFromData(buffer):
+                    safe_image = image.convertToFormat(QImage.Format.Format_RGB32)
+                    temp_cover = Path(tempfile.gettempdir()) / f"spotify_cover_{uuid.uuid4().hex[:8]}.jpg"
+                    safe_image.save(str(temp_cover), "JPG", 95)
+                    object.__setattr__(self.config, "custom_cover_path", str(temp_cover))
+            except Exception as e:
+                self._logger.warning(f"Injeção assíncrona de miniatura Spotify abortada: {e}")
+
         try:
             ydl_opts = self._build_ydl_opts()
             with YtDlpService._network_semaphore:
@@ -798,4 +992,18 @@ class DownloadWorker(QRunnable):
                 self._logger.error(f"Exceção não tratada em Kernel Scope: {e}", exc_info=True)
                 self.broker.emit_error(str(e))
         finally:
+            if getattr(self, '_ephemeral_cookie', None):
+                SessionStateManager.cleanup_ephemeral_cookie_jar(self._ephemeral_cookie)
+                
+            try:
+                final_name = f"{self.config.custom_filename}.{self.config.format_container}"
+                target_path = self.config.output_path / final_name
+                if target_path.exists() and not getattr(self.config, "resolved_output_path", None):
+                    object.__setattr__(self.config, "resolved_output_path", str(target_path))
+                elif not getattr(self.config, "resolved_output_path", None):
+                    files = list(self.config.output_path.glob(f"{self.config.custom_filename}.*"))
+                    if files:
+                        object.__setattr__(self.config, "resolved_output_path", str(files[0]))
+            except Exception:
+                pass
             self.broker.emit_finished()
