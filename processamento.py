@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import Callable, Optional, Any, TypedDict, Dict, List, cast
+from typing import Callable, Iterator, Optional, Any, TypedDict, Dict, List, cast
 
 HAS_CURL_CFFI = importlib.util.find_spec("curl_cffi") is not None
 if not HAS_CURL_CFFI:
@@ -44,6 +44,8 @@ from PyQt6.QtGui import QImage
 class MediaType(Enum):
     AUDIO = auto()
     VIDEO = auto()
+
+T = TypeVar('T')
 
 @dataclass(frozen=True)
 class NormalizedMediaEntity:
@@ -197,14 +199,8 @@ class SpotifyToYTMAdapter:
         if not self.client:
             raise RuntimeError(
                 "Motor de resolução Spotify inoperante: Credenciais OAuth2 não configuradas.\n\n"
-                "Para restabelecer a comunicação DRM, injete as variáveis no ambiente de execução:\n\n"
-                "[Windows PowerShell]:\n"
-                "$env:SPOTIPY_CLIENT_ID=\"seu_client_id\"\n"
-                "$env:SPOTIPY_CLIENT_SECRET=\"seu_client_secret\"\n\n"
-                "[Unix / macOS / Bash]:\n"
-                "export SPOTIPY_CLIENT_ID=\"seu_client_id\"\n"
-                "export SPOTIPY_CLIENT_SECRET=\"seu_client_secret\"\n\n"
-                "Reinicialize a aplicação após a alocação."
+                "Injete as variáveis no ambiente de execução:\n"
+                "SPOTIPY_CLIENT_ID e SPOTIPY_CLIENT_SECRET."
             )
             
         if "playlist" in url:
@@ -215,6 +211,12 @@ class SpotifyToYTMAdapter:
             return self._resolve_album(url)
         raise ValueError("Topologia Spotify não reconhecida (apenas Track, Album, Playlist).")
 
+    def _paginate_results(self, initial_page: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
+        results = initial_page
+        while results:
+            yield from results.get('items', [])
+            results = self.client.next(results) if results.get('next') else None
+
     def _resolve_track(self, url: str) -> NormalizedMediaEntity:
         track_id = self._extract_id(url, "track")
         track_data = self.client.track(track_id)
@@ -223,13 +225,13 @@ class SpotifyToYTMAdapter:
     def _resolve_playlist(self, url: str) -> NormalizedMediaEntity:
         playlist_id = self._extract_id(url, "playlist")
         playlist_info = self.client.playlist(playlist_id, fields='name,owner')
-        results = self.client.playlist_items(playlist_id, additional_types=['track'])
+        initial_page = self.client.playlist_items(playlist_id, additional_types=['track'])
         
-        entities: List[NormalizedMediaEntity] = []
-        for item in results.get('items', []):
-            track = item.get('track')
-            if track:
-                entities.append(self._map_track_to_entity(track))
+        entities: List[NormalizedMediaEntity] = [
+            self._map_track_to_entity(item['track'])
+            for item in self._paginate_results(initial_page)
+            if item.get('track')
+        ]
                 
         return NormalizedMediaEntity(
             original_id=playlist_id,
@@ -243,17 +245,20 @@ class SpotifyToYTMAdapter:
     def _resolve_album(self, url: str) -> NormalizedMediaEntity:
         album_id = self._extract_id(url, "album")
         album_info = self.client.album(album_id)
-        results = self.client.album_tracks(album_id)
+        initial_page = self.client.album_tracks(album_id)
         
-        entities: List[NormalizedMediaEntity] = []
-        for track in results.get('items', []):
-            entities.append(self._map_track_to_entity(track, album_override=album_info.get('name', '')))
+        album_name = album_info.get('name', 'Unknown Album')
+        
+        entities: List[NormalizedMediaEntity] = [
+            self._map_track_to_entity(track, album_override=album_name)
+            for track in self._paginate_results(initial_page)
+        ]
             
         return NormalizedMediaEntity(
             original_id=album_id,
-            title=album_info.get('name', 'Unknown Album'),
+            title=album_name,
             artist=album_info['artists'][0].get('name', 'Unknown') if album_info.get('artists') else 'Unknown',
-            album=album_info.get('name', 'Unknown Album'),
+            album=album_name,
             is_playlist=True,
             children=entities
         )
@@ -299,8 +304,7 @@ class SpotifyToYTMAdapter:
         if not match:
             raise ValueError(f"URL corrompida: Falha na extração de hash de {entity_type}.")
         return match.group(1)
-    
-T = TypeVar('T')
+
 
 def exponential_backoff(retries: int = 3, base_delay: float = 2.0, max_delay: float = 30.0) -> Callable:
     def decorator(func: Callable[..., T]) -> Callable[..., T]:

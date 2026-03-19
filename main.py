@@ -14,7 +14,7 @@ import ssl
 import tempfile
 import subprocess
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Final, Dict, Any, Optional, List, TypeVar, Set
 from pathlib import Path
 from functools import wraps
@@ -25,21 +25,19 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar,
     QMessageBox, QFrame, QScrollArea, QGroupBox, QFormLayout, 
     QCheckBox, QPlainTextEdit, QSplitter, QTabWidget, QRadioButton, 
-    QButtonGroup, QAbstractItemView, QMenu, QDialog, QDialogButtonBox
+    QButtonGroup, QAbstractItemView, QMenu, QDialog, QDialogButtonBox,
+    QTableView
 )
-from PyQt6.QtCore import Qt, QObject, pyqtSignal, QThreadPool, pyqtSlot, QUrl, QRunnable, QTimer
+from PyQt6.QtCore import Qt, QObject, pyqtSignal, QThreadPool, pyqtSlot, QUrl, QRunnable, QTimer, QAbstractTableModel, QModelIndex
 from PyQt6.QtGui import QColor, QPixmap, QFont, QTextCursor, QTextCharFormat, QDesktopServices, QPalette, QAction, QCloseEvent, QImage
 from PyQt6 import sip
 
 import processamento as proc
 
-# =====================================================================
-# INJEÇÃO DE AMBIENTE SANDBOXED
-# =====================================================================
+
 PROJECT_DIR = str(Path(__file__).parent.absolute())
 if PROJECT_DIR not in os.environ.get("PATH", ""):
     os.environ["PATH"] = f"{PROJECT_DIR};{os.environ.get('PATH', '')}"
-# =====================================================================
 
 T = TypeVar('T')
 
@@ -106,8 +104,6 @@ class LocalMetadataEditorDialog(QDialog):
             
         new_stem = re.sub(r'[<>:"/\\|?*]', '', self.in_filename.text()).strip() or "output_modificado"
         target_filepath = self.filepath.with_name(f"{new_stem}{self.filepath.suffix}")
-        
-        # Alocação de sandbox temporal para impedir colisão de descritores
         temp_out = self.filepath.with_suffix(f".temp_{uuid.uuid4().hex[:6]}{self.filepath.suffix}")
         
         cmd = ["ffmpeg", "-y", "-i", str(self.filepath), "-c", "copy"]
@@ -135,7 +131,6 @@ class LocalMetadataEditorDialog(QDialog):
         try:
             subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True, startupinfo=startupinfo)
             
-            # Algoritmo de Troca Atómica (Prevenção de Orphaning Data)
             if target_filepath.exists() and target_filepath.absolute() != self.filepath.absolute():
                 target_filepath.unlink(missing_ok=True)
                 
@@ -352,6 +347,116 @@ class LogViewerWidget(QWidget):
 
     def clear_logs(self) -> None:
         self.text_edit.clear()
+
+class PlaylistTableModel(QAbstractTableModel):
+    def __init__(self, entities: List[proc.NormalizedMediaEntity], parent: Optional[QObject] = None) -> None:
+        super().__init__(parent)
+        self._entities = entities
+        self._checked_states = [True] * len(entities)
+        self._headers = ["Inc.", "Título", "Artista", "Álbum", "Duração"]
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return len(self._entities)
+
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return len(self._headers)
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
+        if not index.isValid():
+            return None
+            
+        row, col = index.row(), index.column()
+        entity = self._entities[row]
+
+        if role == Qt.ItemDataRole.DisplayRole:
+            if col == 1: return entity.title
+            if col == 2: return entity.artist
+            if col == 3: return entity.album
+            if col == 4: return entity.display_duration
+            
+        elif role == Qt.ItemDataRole.CheckStateRole and col == 0:
+            return Qt.CheckState.Checked.value if self._checked_states[row] else Qt.CheckState.Unchecked.value
+            
+        elif role == Qt.ItemDataRole.TextAlignmentRole and col in (0, 4):
+            return Qt.AlignmentFlag.AlignCenter.value
+
+        return None
+
+    def setData(self, index: QModelIndex, value: Any, role: int = Qt.ItemDataRole.EditRole) -> bool:
+        if role == Qt.ItemDataRole.CheckStateRole and index.column() == 0:
+            self._checked_states[index.row()] = (value == Qt.CheckState.Checked.value)
+            self.dataChanged.emit(index, index, [role])
+            return True
+        return False
+
+    def flags(self, index: QModelIndex) -> Qt.ItemFlag:
+        flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+        if index.column() == 0:
+            flags |= Qt.ItemFlag.ItemIsUserCheckable
+        return flags
+
+    def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
+        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
+            return self._headers[section]
+        return None
+
+    def toggle_all(self, state: bool) -> None:
+        self.beginResetModel()
+        self._checked_states = [state] * len(self._entities)
+        self.endResetModel()
+
+    def get_selected_entities(self) -> List[proc.NormalizedMediaEntity]:
+        return [ent for i, ent in enumerate(self._entities) if self._checked_states[i]]
+    
+class PlaylistStagingDialog(QDialog):
+    def __init__(self, entities: List[proc.NormalizedMediaEntity], parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Pré-Processamento de Topologia em Árvore (Playlist)")
+        self.setMinimumSize(900, 500)
+        self.model = PlaylistTableModel(entities, self)
+        self._init_ui()
+
+    def _init_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        
+        lbl_info = QLabel(f"<b>Topologia detectada:</b> Lista de Reprodução ou Álbum ({self.model.rowCount()} nós identificados).<br>Selecione as entidades a transacionar para o motor DSP.")
+        layout.addWidget(lbl_info)
+        
+        self.view = QTableView(self)
+        self.view.setModel(self.model)
+        self.view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.view.verticalHeader().setVisible(False)
+        
+        header = self.view.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        
+        layout.addWidget(self.view)
+        
+        ctrl_layout = QHBoxLayout()
+        btn_sel_all = QPushButton("Selecionar Todos")
+        btn_sel_none = QPushButton("Remover Seleção")
+        
+        btn_sel_all.clicked.connect(lambda: self.model.toggle_all(True))
+        btn_sel_none.clicked.connect(lambda: self.model.toggle_all(False))
+        
+        ctrl_layout.addWidget(btn_sel_all)
+        ctrl_layout.addWidget(btn_sel_none)
+        ctrl_layout.addStretch()
+        
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btn_box.button(QDialogButtonBox.StandardButton.Ok).setText("Confirmar Triagem")
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        
+        ctrl_layout.addWidget(btn_box)
+        layout.addLayout(ctrl_layout)
+
+    def get_selected_entities(self) -> List[proc.NormalizedMediaEntity]:
+        return self.model.get_selected_entities()
 
 @dataclass
 class MetadataCandidate:
@@ -655,7 +760,7 @@ class InspectorPanel(QFrame):
         self.stats_lbl.setObjectName("StatsLabel")
         self.stats_lbl.setWordWrap(True)
         
-        self.btn_custom_cover = QPushButton("Alterar Capa (Local)", left_col)
+        self.btn_custom_cover = QPushButton("Alterar Capa", left_col)
         self.btn_custom_cover.clicked.connect(self._browse_custom_cover)
         
         left_layout.addWidget(self.thumb_lbl)
@@ -876,11 +981,9 @@ class InspectorPanel(QFrame):
 
             target_path = Path.cwd() / "cookies.txt"
             
-            # Algoritmo de Substituição Atómica com Exponential Backoff (Prevenção de I/O Race Condition / WinError 32)
             success = False
             for attempt in range(5):
                 try:
-                    # Gravação intermediária garante a integridade atómica
                     temp_path = target_path.with_suffix(f".tmp{attempt}")
                     shutil.copy2(source_path, temp_path)
                     os.replace(temp_path, target_path)
@@ -1073,6 +1176,13 @@ class InspectorPanel(QFrame):
         else:
             self.rb_video.setEnabled(True)
             self.rb_video.setToolTip("")
+
+        is_playlist_mode = getattr(meta, 'is_playlist', False)
+        self.btn_custom_cover.setEnabled(not is_playlist_mode)
+        if is_playlist_mode:
+            self.btn_custom_cover.setToolTip("A injeção de matrizes gráficas unificadas é inválida para estruturas em árvore (Playlists).")
+        else:
+            self.btn_custom_cover.setToolTip("")
             
         self._recalc_estimate()
 
@@ -1127,39 +1237,92 @@ class InspectorPanel(QFrame):
         if sip.isdeleted(self) or sip.isdeleted(self.stats_lbl) or not self._current_meta: return
         
         meta = self._current_meta
+        is_playlist = getattr(meta, 'is_playlist', False)
+        children = getattr(meta, 'children', []) or []
         
         orig_id = getattr(meta, 'original_id', '')
         source_url = getattr(self, '_current_source_url', '').lower()
         
         is_spotify_ytm = getattr(meta, 'is_search_query', False) or "spotify" in orig_id or "music.youtube" in orig_id or "spotify" in source_url or "music.youtube" in source_url
         is_soundcloud = "soundcloud.com" in orig_id or "soundcloud" in source_url
-        is_video = getattr(meta, 'width', None) is not None
+        is_video_type = self.rb_video.isChecked()
 
-        html_parts = [f"<b>Duração:</b> {getattr(meta, 'display_duration', 'N/A')}"]
-        
-        filesize = getattr(meta, 'filesize', 0)
-        if filesize and filesize > 0:
-            size_mb = filesize / (1024 * 1024)
-            html_parts.append(f"<b>Tamanho Estimado:</b> {size_mb:.2f} MB")
+        total_duration = 0.0
+        total_filesize = 0
 
-        if is_spotify_ytm:
-            album = getattr(meta, 'album', '') or 'Singles/Desconhecido'
-            date = getattr(meta, 'upload_date', '') or 'N/A'
-            html_parts.append(f"<b>Álbum:</b> {album}")
-            html_parts.append(f"<b>Lançamento:</b> {date}")
-            html_parts.append("<b>Topologia:</b> Fonograma Master (DRM/Áudio)")
-        elif is_soundcloud:
-            canal = getattr(meta, 'channel', '') or getattr(meta, 'artist', 'Desconhecido')
-            html_parts.append(f"<b>Uploader (SC):</b> {canal}")
-            html_parts.append("<b>Topologia:</b> Áudio de Plataforma Fechada")
-        elif is_video:
-            res = f"{meta.width}x{meta.height} @ {getattr(meta, 'fps', 'N/A')}fps"
-            canal = getattr(meta, 'channel', '') or 'Desconhecido'
-            html_parts.append(f"<b>Matriz de Vídeo:</b> {res}")
-            html_parts.append(f"<b>Canal (YT):</b> {canal}")
+        if is_playlist:
+            total_duration = sum(float(getattr(c, 'duration', 0) or 0) for c in children)
+            total_filesize = sum(int(getattr(c, 'filesize', 0) or 0) for c in children)
         else:
-            canal = getattr(meta, 'channel', '') or 'Desconhecido'
-            html_parts.append(f"<b>Canal:</b> {canal}")
+            total_duration = float(getattr(meta, 'duration', 0) or 0)
+            total_filesize = int(getattr(meta, 'filesize', 0) or 0)
+
+        if total_filesize <= 0 and total_duration > 0:
+            bitrate_kbps = 128
+            if is_video_type:
+                q_text = self.cb_quality.currentText().lower()
+                if "4k" in q_text or "2160" in q_text: bitrate_kbps = 15000
+                elif "1440" in q_text: bitrate_kbps = 8000
+                elif "1080" in q_text: bitrate_kbps = 5000
+                elif "720" in q_text: bitrate_kbps = 2500
+                elif "480" in q_text: bitrate_kbps = 1000
+                else: bitrate_kbps = 5000 
+            else:
+                fmt = self.cb_container.currentText().lower()
+                if fmt in ['flac', 'wav']:
+                    bitrate_kbps = 900 if fmt == 'flac' else 1411
+                else:
+                    try:
+                        bitrate_kbps = int(self.cb_abitrate.currentData() or 192)
+                    except ValueError:
+                        bitrate_kbps = 192
+            
+            total_filesize = int((bitrate_kbps * 1000 / 8) * total_duration)
+
+        def format_size(size_bytes: int) -> str:
+            if size_bytes <= 0: return "N/A"
+            mb = size_bytes / (1024 * 1024)
+            if mb >= 1024:
+                return f"{mb / 1024:.2f} GB"
+            return f"{mb:.2f} MB"
+
+        def format_duration(seconds: float) -> str:
+            s = int(seconds)
+            if s <= 0: return "N/A"
+            mins, secs = divmod(s, 60)
+            hrs, mins = divmod(mins, 60)
+            if hrs > 0: return f"{hrs:02d}:{mins:02d}:{secs:02d}"
+            return f"{mins:02d}:{secs:02d}"
+
+        html_parts = []
+
+        if is_playlist:
+            html_parts.append(f"<b>Duração Total:</b> {format_duration(total_duration)}")
+            html_parts.append(f"<b>Tamanho Projetado:</b> {format_size(total_filesize)}")
+            html_parts.append(f"<b>Total de Nós (Faixas):</b> {len(children)}")
+            html_parts.append("<b>Topologia:</b> Conjunto de Dados Escalar (Playlist/Álbum)")
+        else:
+            html_parts.append(f"<b>Duração:</b> {format_duration(total_duration)}")
+            html_parts.append(f"<b>Tamanho Projetado:</b> {format_size(total_filesize)}")
+            
+            if is_spotify_ytm:
+                album = getattr(meta, 'album', '') or 'Desconhecido'
+                date = getattr(meta, 'upload_date', '') or 'N/A'
+                html_parts.append(f"<b>Álbum:</b> {album}")
+                html_parts.append(f"<b>Lançamento:</b> {date}")
+                html_parts.append("<b>Topologia:</b> Fonograma Master (DRM/Áudio)")
+            elif is_soundcloud:
+                canal = getattr(meta, 'channel', '') or getattr(meta, 'artist', 'Desconhecido')
+                html_parts.append(f"<b>Uploader (SC):</b> {canal}")
+                html_parts.append("<b>Topologia:</b> Áudio de Plataforma Fechada")
+            elif getattr(meta, 'width', None) is not None:
+                res = f"{meta.width}x{meta.height} @ {getattr(meta, 'fps', 'N/A')}fps"
+                canal = getattr(meta, 'channel', '') or 'Desconhecido'
+                html_parts.append(f"<b>Matriz de Vídeo:</b> {res}")
+                html_parts.append(f"<b>Canal (YT):</b> {canal}")
+            else:
+                canal = getattr(meta, 'channel', '') or 'Desconhecido'
+                html_parts.append(f"<b>Canal:</b> {canal}")
 
         self.stats_lbl.setText("<br>".join(html_parts))
 
@@ -1454,7 +1617,6 @@ class MainWindow(QMainWindow):
         config = self.job_configs.get(job_id)
         if not config: return
         
-        # Recuperação resiliente do artefato final consolidado
         resolved_path_str = getattr(config, 'resolved_output_path', None)
         if resolved_path_str and Path(resolved_path_str).exists():
             filepath = Path(resolved_path_str)
@@ -1481,7 +1643,6 @@ class MainWindow(QMainWindow):
             
         dialog = LocalMetadataEditorDialog(str(filepath), initial_data, self)
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.new_filepath:
-            # Propagação das mutações de estado para a UI e DTO
             object.__setattr__(config, "custom_filename", dialog.new_filepath.stem)
             object.__setattr__(config, "resolved_output_path", str(dialog.new_filepath))
             
@@ -1550,6 +1711,22 @@ class MainWindow(QMainWindow):
     @pyqtSlot(object)
     def on_analysis_success(self, meta: proc.NormalizedMediaEntity) -> None:
         if sip.isdeleted(self) or sip.isdeleted(self.inspector): return
+
+        if getattr(meta, 'is_playlist', False) and getattr(meta, 'children', []):
+            dialog = PlaylistStagingDialog(meta.children, self)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                selected_children = dialog.get_selected_entities()
+                if not selected_children:
+                    self._reset_ui_state()
+                    QMessageBox.information(self, "Operação Revogada", "A transação foi abortada: Nenhum sub-nó foi selecionado.")
+                    return
+                
+
+                meta = replace(meta, children=selected_children)
+            else:
+                self._reset_ui_state()
+                return
+
         self._current_meta = meta
         self.inspector.set_metadata(meta)
         
@@ -1631,7 +1808,6 @@ class MainWindow(QMainWindow):
             elif not target_url.startswith("http") and not target_url.startswith("ytsearch"):
                 target_url = f"https://www.youtube.com/watch?v={target_url}"
 
-            # Ponto de Inversão de Controlo: UI Input > Fallback API
             resolved_filename = data.get('custom_filename', 'output').strip()
             if is_playlist_mode:
                 safe_title = re.sub(r'[<>:"/\\|?*]', '', f"{entity.artist} - {entity.title}")
@@ -1642,8 +1818,6 @@ class MainWindow(QMainWindow):
             final_title = data.get('meta_title', '').strip() if (not is_playlist_mode and data.get('meta_title')) else entity.title
             final_artist = data.get('meta_artist', '').strip() if (not is_playlist_mode and data.get('meta_artist')) else entity.artist
             final_album = data.get('meta_album', '').strip() if (not is_playlist_mode and data.get('meta_album')) else entity.album
-            
-            # Delegação Restrita para Campos Secundários (UI tem sempre a prioridade)
             final_genre = data.get('meta_genre', '').strip() if (not is_playlist_mode and data.get('meta_genre')) else getattr(entity, 'genre', '')
             final_date = data.get('meta_date', '').strip() if (not is_playlist_mode and data.get('meta_date')) else (getattr(entity, 'upload_date', '') or '')
             final_desc = data.get('meta_desc', '').strip() if (not is_playlist_mode and data.get('meta_desc')) else (getattr(entity, 'description', '') or '')
