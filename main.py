@@ -266,10 +266,11 @@ class ThemeManager:
             QMenu::item { padding: 6px 20px 6px 20px; border-radius: 4px; }
             QMenu::item:selected { background-color: #007acc; color: white; }
             QMenu::separator { height: 1px; background: UID_BORDER; margin: 4px 10px; }
+            QLineEdit[readOnly="true"] { background-color: UID_DISABLED_BG; color: UID_DISABLED_TXT; border: 1px dashed UID_BORDER; }
         """
         if is_dark:
-            return qss.replace("UID_BORDER", "#3d3d3d").replace("UID_PANEL_BG", "#1e1e1e").replace("UID_THUMB_BG", "#000000").replace("UID_THUMB_TEXT", "#aaaaaa").replace("UID_CONSOLE_BG", "#0e0e0e").replace("UID_CONSOLE_TEXT", "#d4d4d4").replace("UID_DISABLED_BG", "#333333").replace("UID_DISABLED_TXT", "#777777")
-        return qss.replace("UID_BORDER", "#cccccc").replace("UID_PANEL_BG", "#ffffff").replace("UID_THUMB_BG", "#eaeaea").replace("UID_THUMB_TEXT", "#666666").replace("UID_CONSOLE_BG", "#ffffff").replace("UID_CONSOLE_TEXT", "#333333").replace("UID_DISABLED_BG", "#e0e0e0").replace("UID_DISABLED_TXT", "#999999")
+            return qss.replace("UID_BORDER", "#3d3d3d").replace("UID_PANEL_BG", "#1e1e1e").replace("UID_THUMB_BG", "#000000").replace("UID_THUMB_TEXT", "#aaaaaa").replace("UID_CONSOLE_BG", "#0e0e0e").replace("UID_CONSOLE_TEXT", "#d4d4d4").replace("UID_DISABLED_BG", "#2a2a2a").replace("UID_DISABLED_TXT", "#888888")
+        return qss.replace("UID_BORDER", "#cccccc").replace("UID_PANEL_BG", "#ffffff").replace("UID_THUMB_BG", "#eaeaea").replace("UID_THUMB_TEXT", "#666666").replace("UID_CONSOLE_BG", "#ffffff").replace("UID_CONSOLE_TEXT", "#333333").replace("UID_DISABLED_BG", "#f0f0f0").replace("UID_DISABLED_TXT", "#777777")
 
 class QtLogHandler(logging.Handler, QObject):
     log_record = pyqtSignal(str, int)
@@ -862,6 +863,9 @@ class InspectorPanel(QFrame):
         self.btn_fetch_mb.clicked.connect(self._trigger_musicbrainz_fetch)
         
         self.in_filename = QLineEdit(meta_content)
+        self.in_filename.setReadOnly(True)
+        self.in_filename.setToolTip("Gerado ativamente (Tempo-Real) com base no Template de Saída.")
+        
         self.in_title = QLineEdit(meta_content)
         self.in_artist = QLineEdit(meta_content)
         self.in_album = QLineEdit(meta_content)
@@ -958,6 +962,72 @@ class InspectorPanel(QFrame):
         main_layout.addWidget(right_container, 2)
         
         self._update_ui_mode()
+        
+        self.in_title.textChanged.connect(self._update_dynamic_filename)
+        self.in_artist.textChanged.connect(self._update_dynamic_filename)
+        self.in_album.textChanged.connect(self._update_dynamic_filename)
+        self.in_genre.textChanged.connect(self._update_dynamic_filename)
+        self.in_date.textChanged.connect(self._update_dynamic_filename)
+        self.in_output_tmpl.textChanged.connect(self._update_dynamic_filename)
+        self.cb_container.currentTextChanged.connect(self._update_dynamic_filename)
+
+    @pyqtSlot()
+    def _update_dynamic_filename(self) -> None:
+        if sip.isdeleted(self) or sip.isdeleted(self.in_output_tmpl) or sip.isdeleted(self.in_filename): 
+            return
+            
+        tmpl = self.in_output_tmpl.text().strip()
+        if not tmpl:
+            self.in_filename.setText("")
+            self.in_output_tmpl.setStyleSheet("border: 1px solid #d32f2f;")
+            self.in_output_tmpl.setToolTip("Erro de Consistência: O Template não pode ser nulo.")
+            return
+            
+        self.in_output_tmpl.setStyleSheet("")
+        
+        is_batch = not self.tabs.isTabEnabled(1)
+        
+        title = self.in_title.text().strip() or ("Título" if not is_batch else "Variáveis em Lote")
+        artist = self.in_artist.text().strip() or ("Artista" if not is_batch else "Vários Artistas")
+        album = self.in_album.text().strip() or ("Álbum" if not is_batch else "Vários Álbuns")
+        genre = self.in_genre.text().strip() or "Género"
+        date_full = self.in_date.text().strip()
+        year = date_full[:4] if date_full else "Ano"
+        ext = self.cb_container.currentText() if not sip.isdeleted(self.cb_container) else "ext"
+        
+        mapping = {
+            'title': title,
+            'artist': artist,
+            'uploader': artist,
+            'album': album,
+            'genre': genre,
+            'release_year': year,
+            'upload_date': date_full or "Data",
+            'ext': ext,
+            'playlist': "Playlist",
+            'playlist_index': "01"
+        }
+        
+        def safe_sub(match: re.Match) -> str:
+            key = match.group(1)
+            val = mapping.get(key, f"%({key})s")
+            return re.sub(r'[<>:"/\\|?*]', '', str(val))
+            
+        try:
+            res = re.sub(r'%\(([^)]+)\)s', safe_sub, tmpl)
+            res = re.sub(r'\s+', ' ', res).strip(' -_')
+            self.in_filename.setText(res)
+            
+            if "%(" in res:
+                self.in_output_tmpl.setStyleSheet("border: 1px solid #ff9800;")
+                self.in_output_tmpl.setToolTip("Aviso Léxico: Foram detetadas variáveis órfãs/não preenchidas.")
+            else:
+                self.in_output_tmpl.setToolTip("Sintaxe AST Válida")
+                
+        except Exception as e:
+            self.in_filename.setText("Falha na Resolução Lexical")
+            self.in_output_tmpl.setStyleSheet("border: 1px solid #d32f2f;")
+            self.in_output_tmpl.setToolTip(f"Erro: {str(e)}")
 
     def _browse_custom_cover(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Selecionar Capa Personalizada", "", "Imagens (*.jpg *.jpeg *.png)")
@@ -1124,16 +1194,6 @@ class InspectorPanel(QFrame):
         if sip.isdeleted(self) or sip.isdeleted(self.in_filename): return
         self._current_meta = meta
         
-        base_filename = meta.title
-        if getattr(meta, 'artist', None) and meta.artist != "Unknown":
-            base_filename = f"{meta.artist} - {meta.title}"
-        
-        sanitized_title = re.sub(r'[\x00-\x1f\x7f]', '', base_filename)
-        sanitized_title = re.sub(r'[<>:"/\\|?*]', '', sanitized_title)
-        sanitized_title = re.sub(r'\s+', ' ', sanitized_title).strip()
-        
-        self.in_filename.setText(sanitized_title)
-        
         if not sip.isdeleted(self.in_title): self.in_title.setText(meta.title)
         if not sip.isdeleted(self.in_artist): self.in_artist.setText(meta.artist)
         if not sip.isdeleted(self.in_album): self.in_album.setText(meta.album)
@@ -1185,6 +1245,7 @@ class InspectorPanel(QFrame):
             self.btn_custom_cover.setToolTip("")
             
         self._recalc_estimate()
+        self._update_dynamic_filename()
 
     def set_thumbnail(self, pixmap: QPixmap) -> None:
         if sip.isdeleted(self) or sip.isdeleted(self.thumb_lbl): return
@@ -1232,6 +1293,7 @@ class InspectorPanel(QFrame):
             self.lbl_abitrate.setText("Bitrate:")
             
         self._recalc_estimate()
+        self._update_dynamic_filename()
 
     def _recalc_estimate(self) -> None:
         if sip.isdeleted(self) or sip.isdeleted(self.stats_lbl) or not self._current_meta: return
@@ -1336,6 +1398,22 @@ class InspectorPanel(QFrame):
         bitdepth_text = self.cb_bitdepth.currentText() if not sip.isdeleted(self.cb_bitdepth) else "Auto"
         audio_bit_depth = bitdepth_text.split('-')[0] if "bit" in bitdepth_text else "auto"
 
+        raw_tmpl = self.in_output_tmpl.text().strip() if not sip.isdeleted(self.in_output_tmpl) else ""
+        backend_tmpl = raw_tmpl
+        if backend_tmpl.endswith(".%(ext)s"):
+            backend_tmpl = backend_tmpl[:-8]
+        elif backend_tmpl.endswith(".%(ext)"):
+            backend_tmpl = backend_tmpl[:-7]
+
+        is_batch = not self.tabs.isTabEnabled(1)
+        preview_name = self.in_filename.text().strip()
+        ext = self.cb_container.currentText() if not sip.isdeleted(self.cb_container) else ""
+        
+        if preview_name.endswith(f".{ext}"):
+            preview_name = preview_name[:-(len(ext)+1)]
+            
+        final_custom_filename = "" if is_batch else preview_name
+
         return {
             'media_type': proc.MediaType.VIDEO if self.rb_video.isChecked() else proc.MediaType.AUDIO,
             'format_container': self.cb_container.currentText() if not sip.isdeleted(self.cb_container) else "mp3",
@@ -1345,9 +1423,9 @@ class InspectorPanel(QFrame):
             'audio_bitrate': self.cb_abitrate.currentData() if not sip.isdeleted(self.cb_abitrate) and self.cb_abitrate.isEnabled() else "0",
             'audio_sample_rate': audio_sample_rate,
             'audio_bit_depth': audio_bit_depth, 
-            'custom_filename': self.in_filename.text().strip() if not sip.isdeleted(self.in_filename) else "output",
+            'custom_filename': final_custom_filename,
             
-            'output_template': self.in_output_tmpl.text().strip() if not sip.isdeleted(self.in_output_tmpl) else "",
+            'output_template': backend_tmpl,
             'ffmpeg_path': self.in_ffmpeg_path.text().strip() if not sip.isdeleted(self.in_ffmpeg_path) else "",
             'custom_flags': self.in_custom_flags.text().strip() if not sip.isdeleted(self.in_custom_flags) else "",
             
@@ -1721,7 +1799,6 @@ class MainWindow(QMainWindow):
                     QMessageBox.information(self, "Operação Revogada", "A transação foi abortada: Nenhum sub-nó foi selecionado.")
                     return
                 
-
                 meta = replace(meta, children=selected_children)
             else:
                 self._reset_ui_state()
@@ -1808,12 +1885,10 @@ class MainWindow(QMainWindow):
             elif not target_url.startswith("http") and not target_url.startswith("ytsearch"):
                 target_url = f"https://www.youtube.com/watch?v={target_url}"
 
-            resolved_filename = data.get('custom_filename', 'output').strip()
-            if is_playlist_mode:
+            resolved_filename = data.get('custom_filename', '').strip()
+            if is_playlist_mode or not resolved_filename:
                 safe_title = re.sub(r'[<>:"/\\|?*]', '', f"{entity.artist} - {entity.title}")
                 resolved_filename = safe_title.strip()
-            else:
-                resolved_filename = re.sub(r'[<>:"/\\|?*]', '', resolved_filename).strip()
 
             final_title = data.get('meta_title', '').strip() if (not is_playlist_mode and data.get('meta_title')) else entity.title
             final_artist = data.get('meta_artist', '').strip() if (not is_playlist_mode and data.get('meta_artist')) else entity.artist
@@ -1918,7 +1993,10 @@ class MainWindow(QMainWindow):
         row = self.table.rowCount()
         self.table.insertRow(row)
         
-        display_name = f"{config.custom_filename}.{config.format_container}"
+        display_name = config.custom_filename if config.custom_filename else "Em processamento"
+        if display_name and config.format_container:
+            display_name = f"{display_name}.{config.format_container}"
+            
         title_item = QTableWidgetItem(display_name)
         title_item.setToolTip(config.meta_title)
         title_item.setData(Qt.ItemDataRole.UserRole, config.job_id)
@@ -2004,6 +2082,12 @@ class MainWindow(QMainWindow):
                 item.setText(status_text)
                 item.setForeground(color)
             
+            config = self.job_configs.get(job_id)
+            if config and getattr(config, 'custom_filename', None):
+                title_item = self.table.item(row, 0)
+                if title_item is not None:
+                    title_item.setText(f"{config.custom_filename}.{config.format_container}")
+
             if "Concluído" in status_text: 
                 widget = self.table.cellWidget(row, 3)
                 if isinstance(widget, QProgressBar):
