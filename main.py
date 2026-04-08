@@ -11,7 +11,6 @@ import urllib.request
 import urllib.error
 import time
 import ssl
-import tempfile
 import subprocess
 import shutil
 from dataclasses import dataclass, replace
@@ -1885,17 +1884,38 @@ class MainWindow(QMainWindow):
             elif not target_url.startswith("http") and not target_url.startswith("ytsearch"):
                 target_url = f"https://www.youtube.com/watch?v={target_url}"
 
-            resolved_filename = data.get('custom_filename', '').strip()
-            if is_playlist_mode or not resolved_filename:
-                safe_title = re.sub(r'[<>:"/\\|?*]', '', f"{entity.artist} - {entity.title}")
-                resolved_filename = safe_title.strip()
-
-            final_title = data.get('meta_title', '').strip() if (not is_playlist_mode and data.get('meta_title')) else entity.title
-            final_artist = data.get('meta_artist', '').strip() if (not is_playlist_mode and data.get('meta_artist')) else entity.artist
-            final_album = data.get('meta_album', '').strip() if (not is_playlist_mode and data.get('meta_album')) else entity.album
+            final_title = data.get('meta_title', '').strip() if (not is_playlist_mode and data.get('meta_title')) else (entity.title or "")
+            final_artist = data.get('meta_artist', '').strip() if (not is_playlist_mode and data.get('meta_artist')) else (entity.artist or "")
+            final_album = data.get('meta_album', '').strip() if (not is_playlist_mode and data.get('meta_album')) else (entity.album or "")
             final_genre = data.get('meta_genre', '').strip() if (not is_playlist_mode and data.get('meta_genre')) else getattr(entity, 'genre', '')
             final_date = data.get('meta_date', '').strip() if (not is_playlist_mode and data.get('meta_date')) else (getattr(entity, 'upload_date', '') or '')
             final_desc = data.get('meta_desc', '').strip() if (not is_playlist_mode and data.get('meta_desc')) else (getattr(entity, 'description', '') or '')
+
+            resolved_filename = data.get('custom_filename', '').strip()
+            if is_playlist_mode or not resolved_filename:
+                tmpl = data.get('output_template', '%(title)s - %(artist)s')
+                if not tmpl:
+                    tmpl = "%(title)s - %(artist)s"
+                    
+                mapping = {
+                    'title': final_title,
+                    'artist': final_artist,
+                    'uploader': final_artist,
+                    'album': final_album,
+                    'genre': final_genre,
+                    'release_year': final_date[:4] if final_date else "",
+                    'upload_date': final_date[:4] if final_date else ""
+                }
+                
+                def safe_sub(match: re.Match) -> str:
+                    key = match.group(1)
+                    val = mapping.get(key, f"%({key})s")
+                    return re.sub(r'[<>:"/\\|?*]', '', str(val))
+                    
+                res = re.sub(r'%\(([^)]+)\)s', safe_sub, tmpl)
+                res = re.sub(r'%\([^)]+\)s', '', res)
+                res = re.sub(r'\s+', ' ', res).strip(' -_')
+                resolved_filename = res or "output_stream"
 
             config = proc.DownloadJobConfig(
                 job_id=job_id,
