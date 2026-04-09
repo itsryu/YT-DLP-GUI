@@ -1145,6 +1145,98 @@ class InspectorPanel(QFrame):
             self.in_custom_flags.setText(new_flags)
             logging.info("[Interface] Vetor de Flags mutado através do GUI Transacional.")
 
+    def load_from_config(self, config: Any) -> None:
+        if getattr(config, 'media_type', None) == proc.MediaType.VIDEO:
+            self.rb_video.setChecked(True)
+        else:
+            self.rb_audio.setChecked(True)
+            
+        self._update_ui_mode()
+
+        container = getattr(config, 'format_container', '')
+        if container:
+            idx = self.cb_container.findText(container, Qt.MatchFlag.MatchExactly)
+            if idx >= 0: self.cb_container.setCurrentIndex(idx)
+
+        if hasattr(config, 'video_codec'):
+            idx = self.cb_vcodec.findText(config.video_codec, Qt.MatchFlag.MatchContains | Qt.MatchFlag.MatchCaseSensitive)
+            if idx >= 0: self.cb_vcodec.setCurrentIndex(idx)
+
+        if hasattr(config, 'audio_codec'):
+            idx = self.cb_acodec.findText(config.audio_codec, Qt.MatchFlag.MatchContains | Qt.MatchFlag.MatchCaseSensitive)
+            if idx >= 0: self.cb_acodec.setCurrentIndex(idx)
+
+        if hasattr(config, 'quality_preset'):
+            idx = self.cb_quality.findText(config.quality_preset, Qt.MatchFlag.MatchExactly)
+            if idx >= 0: self.cb_quality.setCurrentIndex(idx)
+
+        if hasattr(config, 'audio_bitrate'):
+            idx = self.cb_abitrate.findData(str(config.audio_bitrate))
+            if idx >= 0: self.cb_abitrate.setCurrentIndex(idx)
+
+        if hasattr(config, 'audio_sample_rate'):
+            asr_val = "auto" if config.audio_sample_rate == 0 else str(config.audio_sample_rate)
+            idx = self.cb_asr.findData(asr_val)
+            if idx >= 0: self.cb_asr.setCurrentIndex(idx)
+
+        self.in_title.setText(getattr(config, 'meta_title', ''))
+        self.in_artist.setText(getattr(config, 'meta_artist', ''))
+        self.in_album.setText(getattr(config, 'meta_album', ''))
+        self.in_genre.setText(getattr(config, 'meta_genre', ''))
+        self.in_date.setText(getattr(config, 'meta_date', ''))
+        self.in_desc.setPlainText(getattr(config, 'meta_desc', ''))
+
+        self.chk_meta.setChecked(getattr(config, 'embed_metadata', True))
+        self.chk_thumb.setChecked(getattr(config, 'embed_thumbnail', True))
+        self.chk_subs.setChecked(getattr(config, 'embed_subs', False))
+        self.chk_norm.setChecked(getattr(config, 'normalize_audio', False))
+        self.chk_cookies.setChecked(getattr(config, 'use_browser_cookies', False))
+
+        if hasattr(config, 'output_template') and config.output_template:
+            tmpl = config.output_template
+            if not tmpl.endswith(".%(ext)s"):
+                tmpl += ".%(ext)s"
+            self.in_output_tmpl.setText(tmpl)
+
+        if hasattr(config, 'ffmpeg_path'):
+            self.in_ffmpeg_path.setText(config.ffmpeg_path)
+
+        if hasattr(config, 'custom_flags'):
+            if hasattr(self, 'in_custom_flags') and not sip.isdeleted(self.in_custom_flags):
+                self.in_custom_flags.setText(config.custom_flags)
+
+        class MockEntity:
+            def __init__(self, cfg):
+                self.is_playlist = False
+                self.children = []
+                self.original_id = getattr(cfg, 'url', '')
+                self.duration = 0.0
+                self.filesize = 0
+                self.is_search_query = False
+                self.width = None
+                self.height = None
+                self.fps = None
+                self.channel = getattr(cfg, 'meta_artist', 'Desconhecido')
+                
+                self.title = getattr(cfg, 'meta_title', '')
+                self.artist = getattr(cfg, 'meta_artist', '')
+                self.album = getattr(cfg, 'meta_album', '')
+                self.genre = getattr(cfg, 'meta_genre', '')
+                self.upload_date = getattr(cfg, 'meta_date', '')
+                self.description = getattr(cfg, 'meta_desc', '')
+                self.thumbnail_url = getattr(cfg, 'spotify_thumb_url', None)
+
+        self._current_meta = MockEntity(config)
+        self._current_source_url = getattr(config, 'url', '')
+
+        if hasattr(config, 'custom_cover_path') and config.custom_cover_path:
+            path = Path(config.custom_cover_path)
+            if path.exists():
+                self._local_custom_cover_path = str(path)
+                self.set_thumbnail(QPixmap(str(path)))
+
+        self._update_dynamic_filename()
+
     @pyqtSlot()
     def _update_dynamic_filename(self) -> None:
         if sip.isdeleted(self) or sip.isdeleted(self.in_output_tmpl) or sip.isdeleted(self.in_filename): 
@@ -2145,14 +2237,20 @@ class MainWindow(QMainWindow):
         config = self.job_configs.get(job_id)
         if not config: return
         
-        row = self.get_row_by_id(job_id)
-        if row >= 0:
-            item = self.table.item(row, 2)
-            if item is not None:
-                item.setText("Na Fila (Retentativa)")
-                item.setData(Qt.ItemDataRole.ForegroundRole, None)
-                
-        self._spawn_download(config, is_retry=True)
+        self.url_input.blockSignals(True)
+        self.url_input.setText(config.url)
+        self.url_input.blockSignals(False)
+        
+        if not sip.isdeleted(self.inspector):
+            self.inspector.load_from_config(config)
+            self._current_meta = self.inspector._current_meta 
+            self.inspector.setVisible(True)
+            
+        if not sip.isdeleted(self.action_bar):
+            self.action_bar.setVisible(True)
+            
+        self._remove_from_queue(job_id)
+        
 
     def _spawn_download(self, config: proc.DownloadJobConfig, is_retry: bool = False) -> None:
         runnable = proc.DownloadWorker(config)
@@ -2255,8 +2353,32 @@ class MainWindow(QMainWindow):
 
     def on_job_error(self, job_id: str, err: str) -> None:
         if sip.isdeleted(self): return
+        
         self._terminal_jobs.add(job_id)
         self._cleanup_job(job_id, "✘ Erro", QColor("#d32f2f"))
+
+        err_lower = err.lower()
+        is_cdn_block = "googlevideo.com" in err_lower and ("timed out" in err_lower or "timeout" in err_lower)
+        is_custom_exc = "NetworkBlockedCDNError" in err
+        
+        if is_cdn_block or is_custom_exc:
+            mitigation_html = (
+                "<p>A extração colapsou devido a uma restrição de pacotes (Timeout) no nó de Distribuição de Conteúdo (CDN).</p>"
+                "<p>Este comportamento é característico de <b>Redes Corporativas</b> ou académicas equipadas com firewalls restritivos (Inspeção Profunda de Pacotes).</p>"
+                "<br>"
+                "<b>Estratégias de Mitigação:</b>"
+                "<ul>"
+                "<li><b>Alterar Topologia de Rede:</b> Migrar o host para uma rede externa (ex: Hotspot 4G/5G).</li>"
+                "<li><b>Tunelamento Criptográfico (VPN):</b> Ofuscar o tráfego da camada de transporte encapsulando a conexão.</li>"
+                "<li><b>Configurar Proxy HTTP/SOCKS:</b> No painel de Configuração Avançada, em <i>Parâmetros do Motor</i>, ative a flag <code>--proxy</code> e defina um nó de saída seguro.</li>"
+                "</ul>"
+            )
+            
+            msg_box = QMessageBox(self)
+            msg_box.setIcon(QMessageBox.Icon.Warning)
+            msg_box.setWindowTitle("Anomalia de Transporte: Bloqueio de Infraestrutura")
+            msg_box.setText(mitigation_html)
+            msg_box.exec()
 
     def cancel_job(self, job_id: str) -> None:
         if job_id in self.active_runnables:
@@ -2303,8 +2425,8 @@ class MainWindow(QMainWindow):
                 if isinstance(widget, QProgressBar):
                     widget.setValue(0)
                 
-                btn_retry = QPushButton("Repetir")
-                btn_retry.setMinimumWidth(110)
+                btn_retry = QPushButton("Repetir") 
+                btn_retry.setMinimumWidth(120)
                 btn_retry.setObjectName("PrimaryAction")
                 btn_retry.clicked.connect(lambda _, jid=job_id: self.retry_job(jid))
                 

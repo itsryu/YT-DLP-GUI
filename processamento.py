@@ -47,6 +47,10 @@ class MediaType(Enum):
 
 T = TypeVar('T')
 
+class NetworkBlockedCDNError(Exception):
+    """ bloqueios na camada de transporte em CDN, característico de firewalls L7 """
+    pass
+
 @dataclass(frozen=True)
 class NormalizedMediaEntity:
     original_id: str
@@ -876,8 +880,15 @@ class DownloadWorker(QRunnable):
         except Exception as e:
             self._cleanup_workspace()
             if not self._is_cancelled:
-                self._logger.error(f"Exceção em contexto de execução (Worker Scope): {e}", exc_info=True)
-                self.broker.emit_error(str(e))
+                err_msg = str(e)
+                err_lower = err_msg.lower()
+                
+                self._logger.error(f"Exceção em contexto de execução (Worker Scope): {err_msg}", exc_info=True)
+                
+                if "googlevideo.com" in err_lower and ("timed out" in err_lower or "timeout" in err_lower):
+                    self.broker.emit_error("NetworkBlockedCDNError: O acesso à CDN primária colapsou. Sintoma de firewall restritivo.")
+                else:
+                    self.broker.emit_error(err_msg)
         finally:
             if getattr(self, '_ephemeral_cookie', None):
                 SessionStateManager.cleanup_ephemeral_cookie_jar(self._ephemeral_cookie)
