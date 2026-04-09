@@ -253,20 +253,26 @@ class SpotifyToYTMAdapter:
         )
 
     def _map_track_to_entity(self, track_data: Dict[str, Any], album_override: str = "") -> NormalizedMediaEntity:
-        artists_data = track_data.get('artists', [])
+        if not track_data:
+            raise ValueError("O payload do fonograma (track_data) encontra-se nulo ou corrompido.")
+
+        artists_data = track_data.get('artists') or []
         artist = ", ".join([a.get('name', 'Unknown') for a in artists_data]) if artists_data else 'Unknown'
         
-        album = album_override or track_data.get('album', {}).get('name', '')
-        thumb = track_data.get('album', {}).get('images', [{}])[0].get('url') if track_data.get('album') else None
+        album_data = track_data.get('album') or {}
+        album = album_override or album_data.get('name', '')
+        
+        images = album_data.get('images') or []
+        thumb = images[0].get('url') if isinstance(images, list) and len(images) > 0 else None
             
         entity = NormalizedMediaEntity(
-            original_id=track_data.get('id', ''),
-            title=track_data.get('name', ''),
+            original_id=track_data.get('id') or '',
+            title=track_data.get('name', 'Unknown Track'),
             artist=artist,
             album=album,
             duration=float(track_data.get('duration_ms', 0) / 1000.0),
             thumbnail_url=thumb,
-            upload_date=track_data.get('album', {}).get('release_date')
+            upload_date=album_data.get('release_date')
         )
         
         return NormalizedMediaEntity(

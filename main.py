@@ -1093,7 +1093,11 @@ class InspectorPanel(QFrame):
         ffmpeg_layout.addWidget(self.in_ffmpeg_path)
         ffmpeg_layout.addWidget(btn_browse_ffmpeg)
         
-        default_flags = '--extractor-args "youtube:player_client=android,tv" --match-filter "!is_live & url!*=/shorts/" --force-ipv4'
+        default_flags = (
+            '--extractor-args "youtube:player_client=android,tv" '
+            '--match-filter "!is_live & url!*=/shorts/ & title!~=\'(?i)(official video|music video|videoclipe|clip|visualizer|live|cover|karaoke|instrumental|acústico|acoustic)\'" '
+            '--force-ipv4'
+        )
         self.in_custom_flags = QLineEdit(default_flags, dev_group)
         self.in_custom_flags.setReadOnly(True)
         
@@ -2146,7 +2150,7 @@ class MainWindow(QMainWindow):
             
             if getattr(entity, 'is_search_query', False) or target_url.startswith("ytmsearch") or target_url.startswith("ytsearch"):
                 query = target_url.split(":", 1)[-1] if ":" in target_url else target_url
-                target_url = f'ytsearch1:{query.strip()} "Provided to YouTube"'
+                target_url = f'ytsearch5:{query.strip()} "Provided to YouTube"'
                 
             elif not target_url.startswith("http") and not target_url.startswith("ytsearch"):
                 target_url = f"https://www.youtube.com/watch?v={target_url}"
