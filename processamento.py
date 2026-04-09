@@ -27,7 +27,7 @@ if not HAS_CURL_CFFI:
 
 try:
     import yt_dlp  # type: ignore
-    from yt_dlp.utils import DownloadError  # type: ignore
+    from yt_dlp.utils import DownloadError, YoutubeDLError  # type: ignore
     from yt_dlp.networking.impersonate import ImpersonateTarget # type: ignore
 except ImportError as e:
     raise ImportError(f"CRITICAL: Dependência yt-dlp não resolvida. {e}")
@@ -329,6 +329,38 @@ class SessionStateManager:
             try: os.unlink(path)
             except OSError: pass
 
+class TlsImpersonationProvider:
+    _logger = logging.getLogger(__name__)
+    _resolved_target: Optional[ImpersonateTarget] = None
+    _TARGET_MATRIX: List[str] = ['chrome99', 'chrome104', 'chrome110', 'chrome116', 'chrome120', 'chrome124', 'chrome', 'safari_ios', 'firefox_102', 'firefox_115', 'firefox_120', 'firefox', 'edge_110', 'edge_116', 'edge_120', 'edge', 'android', 'ios', 'mweb', 'default']
+    _is_cached: bool = False
+
+    @classmethod
+    def get_target(cls) -> Optional[ImpersonateTarget]:
+        if cls._is_cached:
+            return cls._resolved_target
+
+        if not HAS_CURL_CFFI:
+            cls._is_cached = True
+            return None
+
+        for client_name in cls._TARGET_MATRIX:
+            try:
+                target = ImpersonateTarget(client=client_name)
+                with yt_dlp.YoutubeDL({'impersonate': target, 'quiet': True}):
+                    pass
+                
+                cls._resolved_target = target
+                cls._is_cached = True
+                cls._logger.debug(f"[TLS] Handshake validado com sucesso usando target: {client_name}")
+                return target
+            except Exception:
+                continue
+        
+        cls._logger.error("[TLS] Exaustão total da matriz de personificação. Operando em modo padrão.")
+        cls._is_cached = True
+        return None
+
 class YtDlpService:
     URL_REGEX = re.compile(r'^(https?://)?(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com|vimeo\.com|soundcloud\.com|open\.spotify\.com)/.+$')
     _network_semaphore = threading.BoundedSemaphore(value=5)
@@ -341,13 +373,27 @@ class YtDlpService:
     @exponential_backoff(retries=3)
     def extract_info_sync(cls, url: str) -> YtDlpExtractedInfo:
         ydl_opts_base: Dict[str, Any] = {
-            'quiet': True, 'no_warnings': True, 'extract_flat': 'in_playlist', 'socket_timeout': 15,
-            'logger': logging.getLogger('yt_dlp_internal'), 'remote_components': ['ejs:github'],
-            'extractor_args': {'youtube': {'player_client': ['android', 'ios', 'mweb', 'web'], 'player_skip': ['web_embedded', 'tv']}},
+            'quiet': True, 
+            'no_warnings': True, 
+            'extract_flat': 'in_playlist', 
+            'socket_timeout': 30,
+            'source_address': '0.0.0.0', 
+            'logger': logging.getLogger('yt_dlp_internal'), 
+            'remote_components': ['ejs:github'],
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['web', 'tv', 'default'],
+                    'player_skip': ['android', 'ios', 'mweb']
+                }
+            },
             'javascript_executor': 'deno',
             'cachedir': False,
+            'retries': 0,
         }
-        if HAS_CURL_CFFI: ydl_opts_base['impersonate'] = ImpersonateTarget(client='chrome')
+        
+        target = TlsImpersonationProvider.get_target()
+        if target:
+            ydl_opts_base['impersonate'] = target
 
         with cls._network_semaphore:
             try:
@@ -639,14 +685,34 @@ class DownloadWorker(QRunnable):
         if current_dir not in os.environ["PATH"]: os.environ["PATH"] = f"{current_dir}{os.pathsep}{os.environ['PATH']}"
 
         opts: dict[str, Any] = {
-            'outtmpl': out_tmpl, 'progress_hooks': [self._progress_hook], 'quiet': True, 'no_warnings': False,
-            'socket_timeout': 30, 'logger': YtDlpInterceptorLogger(self.config.job_id, self._check_abort),
-            'javascript_executor': 'deno', 'extractor_args': {'youtube': {'player_client': ['android', 'ios', 'mweb', 'web'], 'player_skip': ['web_embedded', 'tv'], 'include_live_chat': False}},
-            'youtube_include_dash_manifest': True, 'postprocessors': [], 'postprocessor_args': {}, 'remote_components': ['ejs:github'],
+            'outtmpl': out_tmpl, 
+            'progress_hooks': [self._progress_hook], 
+            'quiet': True, 
+            'no_warnings': False,
+            'socket_timeout': 30, 
+            'source_address': '0.0.0.0', 
+            'logger': YtDlpInterceptorLogger(self.config.job_id, self._check_abort),
+            'javascript_executor': 'deno', 
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['web', 'tv', 'default'],
+                    'player_skip': ['android', 'ios', 'mweb']
+                }
+            },
+            'youtube_include_dash_manifest': True, 
+            'postprocessors': [], 
+            'postprocessor_args': {}, 
+            'remote_components': ['ejs:github'],
             'cachedir': False,
+            'retries': 0,
+            'fragment_retries': 0,
+            'retry_sleep': 'exp',
         }
         
-        if HAS_CURL_CFFI: opts['impersonate'] = ImpersonateTarget(client='chrome')
+        target = TlsImpersonationProvider.get_target()
+        if target:
+            opts['impersonate'] = target
+
         if self.config.ffmpeg_path: opts['ffmpeg_location'] = self.config.ffmpeg_path
         if self.config.use_browser_cookies:
             self._ephemeral_cookie = SessionStateManager.create_ephemeral_cookie_jar()

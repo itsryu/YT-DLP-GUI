@@ -36,7 +36,7 @@ class TestSpotifyToYTMAdapter(unittest.TestCase):
             self.adapter = SpotifyToYTMAdapter()
 
     def test_is_spotify_url(self):
-        self.assertTrue(self.adapter.is_spotify_url("https://open.spotify.com/track/4PTG3Z6ehGkBFwjybzWkR8?si=f15133eac8f74ad1"))
+        self.assertTrue(self.adapter.is_spotify_url("https://open.spotify.com/intl-pt/track/0iuwev4ei8YmPTaD1pihIu?si=7d0676f53ddf4e83"))
         self.assertFalse(self.adapter.is_spotify_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ"))
 
     def test_extract_id_resolves_valid_hashes(self):

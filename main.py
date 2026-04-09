@@ -17,6 +17,7 @@ from dataclasses import dataclass, replace
 from typing import Callable, Final, Dict, Any, Optional, List, TypeVar, Set
 from pathlib import Path
 from functools import wraps
+import shlex
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -148,6 +149,159 @@ class LocalMetadataEditorDialog(QDialog):
         except Exception as e:
             if temp_out.exists(): temp_out.unlink()
             QMessageBox.critical(self, "Exceção não Tratada de I/O", str(e))
+
+@dataclass(frozen=True)
+class EngineFlag:
+    cli_arg: str
+    description: str
+    requires_input: bool = False
+    category: str = "Geral"
+
+class EngineFlagsDialog(QDialog):
+    def __init__(self, current_flags: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Configuração Avançada de Parâmetros (CLI)")
+        self.setMinimumSize(650, 500)
+        
+        self._current_flags: str = current_flags
+        self._flag_registry: List[EngineFlag] = self._initialize_registry()
+        self._ui_elements: Dict[str, tuple[QCheckBox, Optional[QLineEdit]]] = {}
+        
+        self._init_ui()
+        self._hydrate_state()
+
+    def _initialize_registry(self) -> List[EngineFlag]:
+        return [
+            # Domínio: Rede e Transporte
+            EngineFlag("--force-ipv4", "Forçar resolução de sockets via IPv4", category="Rede e Transporte"),
+            EngineFlag("--force-ipv6", "Forçar resolução de sockets via IPv6", category="Rede e Transporte"),
+            EngineFlag("--limit-rate", "Limitar largura de banda (ex: 50K, 2M)", requires_input=True, category="Rede e Transporte"),
+            EngineFlag("--proxy", "URI de Proxy HTTP/SOCKS", requires_input=True, category="Rede e Transporte"),
+            EngineFlag("--socket-timeout", "Tempo limite de resposta (Time-to-Live) em segundos", requires_input=True, category="Rede e Transporte"),
+            
+            # Domínio: Evasão e Falsificação
+            EngineFlag("--geo-bypass", "Contornar restrições geográficas via cabeçalhos injetados", category="Evasão de Restrições"),
+            EngineFlag("--cookies-from-browser", "Extrair matriz de estado (Cookies) do navegador (ex: chrome, firefox)", requires_input=True, category="Evasão de Restrições"),
+            EngineFlag("--user-agent", "Falsificação estrita da string de User-Agent", requires_input=True, category="Evasão de Restrições"),
+            
+            # Domínio: Regulação de Fluxo e Sincronismo
+            EngineFlag("--sleep-requests", "Atraso determinístico entre requisições iterativas (segundos)", requires_input=True, category="Regulação de Fluxo"),
+            EngineFlag("--sleep-interval", "Atraso limite inferior (randômico) entre transações (segundos)", requires_input=True, category="Regulação de Fluxo"),
+            EngineFlag("--max-sleep-interval", "Atraso limite superior (randômico) entre transações (segundos)", requires_input=True, category="Regulação de Fluxo"),
+            
+            # Domínio: Operações de Sistema de Arquivos
+            EngineFlag("--ignore-errors", "Ignorar exceções isoladas e manter topologia contínua", category="Sistema de Arquivos"),
+            EngineFlag("--no-warnings", "Suprimir pipeline de avisos no STDERR", category="Sistema de Arquivos"),
+            EngineFlag("--restrict-filenames", "Normalizar nomenclatura para o padrão ASCII (suprime espaços e caracteres especiais)", category="Sistema de Arquivos"),
+            EngineFlag("--windows-filenames", "Garantir conversão de nomenclatura para conformidade POSIX/Win32", category="Sistema de Arquivos"),
+            EngineFlag("--no-overwrites", "Bloquear sobrescrita (Skip) em partições alocadas previamente", category="Sistema de Arquivos"),
+            EngineFlag("--continue", "Forçar a retoma explícita de blocos binários não consolidados", category="Sistema de Arquivos"),
+            
+            # Domínio: Processamento Estrutural em Árvore
+            EngineFlag("--match-filter", "Filtro booleano AST (ex: !is_live & url!*=/shorts/)", requires_input=True, category="Processamento Estrutural"),
+            EngineFlag("--playlist-reverse", "Inverter a fila do algoritmo de busca (LIFO)", category="Processamento Estrutural"),
+            EngineFlag("--break-on-existing", "Interromper Thread ao encontrar nó persistido (Otimiza rotinas de sincronização)", category="Processamento Estrutural"),
+            EngineFlag("--max-downloads", "Limite quantitativo absoluto de nós a extrair", requires_input=True, category="Processamento Estrutural"),
+            
+            # Domínio: Injeção de Metadados
+            EngineFlag("--write-subs", "Efetuar I/O de legendas nativas", category="Metadados e Telemetria"),
+            EngineFlag("--write-auto-subs", "Sintetizar matriz de legendas automáticas (ASR)", category="Metadados e Telemetria"),
+            EngineFlag("--sub-langs", "Vetor ISO de segmentação de idiomas (ex: en,pt)", requires_input=True, category="Metadados e Telemetria"),
+            EngineFlag("--embed-chapters", "Injetar matriz estrutural de capítulos via multiplexador (FFmpeg)", category="Metadados e Telemetria"),
+            EngineFlag("--write-info-json", "Descarregar manifesto RAW (JSON) de telemetria da entidade", category="Metadados e Telemetria"),
+            
+            # Domínio: Acesso de Baixo Nível
+            EngineFlag("--extractor-args", "Injeção nativa de dependências lógicas ao módulo base (ex: youtube:player_client=android)", requires_input=True, category="Baixo Nível")
+        ]
+
+    def _init_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        
+        categories: Dict[str, List[EngineFlag]] = {}
+        for flag in self._flag_registry:
+            categories.setdefault(flag.category, []).append(flag)
+
+        for category, flags in categories.items():
+            group = QGroupBox(category, container)
+            group_layout = QVBoxLayout(group)
+            
+            for flag in flags:
+                row_layout = QHBoxLayout()
+                chk = QCheckBox(f"{flag.cli_arg} - {flag.description}", group)
+                
+                input_field = None
+                if flag.requires_input:
+                    input_field = QLineEdit(group)
+                    input_field.setPlaceholderText("Atribuir valor...")
+                    input_field.setEnabled(False)
+                    
+                    def toggle_input(state: int, field: QLineEdit = input_field) -> None:
+                        field.setEnabled(state == Qt.CheckState.Checked.value)
+                        
+                    chk.stateChanged.connect(toggle_input)
+                    
+                row_layout.addWidget(chk)
+                if input_field:
+                    row_layout.addWidget(input_field)
+                    
+                group_layout.addLayout(row_layout)
+                self._ui_elements[flag.cli_arg] = (chk, input_field)
+                
+            container_layout.addWidget(group)
+
+        container_layout.addStretch()
+        scroll.setWidget(container)
+        layout.addWidget(scroll)
+        
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btn_box.button(QDialogButtonBox.StandardButton.Ok).setText("Aplicar")
+        btn_box.button(QDialogButtonBox.StandardButton.Cancel).setText("Cancelar")
+        
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
+
+    def _hydrate_state(self) -> None:
+        if not self._current_flags:
+            return
+            
+        try:
+            tokens = shlex.split(self._current_flags)
+        except ValueError as e:
+            logging.warning(f"[Lexer] Falha ao efetuar parse da sintaxe AST: {e}")
+            tokens = self._current_flags.split()
+
+        for i, token in enumerate(tokens):
+            if token in self._ui_elements:
+                chk, input_field = self._ui_elements[token]
+                chk.setChecked(True)
+                
+                flag = next((f for f in self._flag_registry if f.cli_arg == token), None)
+                if flag and flag.requires_input and input_field:
+                    if i + 1 < len(tokens) and not tokens[i+1].startswith("--"):
+                        input_field.setText(tokens[i+1])
+
+    def compile_flags(self) -> str:
+        compiled = []
+        
+        for cli_arg, (chk, input_field) in self._ui_elements.items():
+            if chk.isChecked():
+                if input_field:
+                    val = input_field.text().strip()
+                    if val:
+                        val_clean = val.replace('"', '\\"')
+                        compiled.append(f'{cli_arg} "{val_clean}"')
+                else:
+                    compiled.append(cli_arg)
+                    
+        return " ".join(compiled)
 
 class DialogThumbnailSignals(QObject):
     ready = pyqtSignal(int, QImage)
@@ -941,10 +1095,19 @@ class InspectorPanel(QFrame):
         
         default_flags = '--extractor-args "youtube:player_client=android,tv" --match-filter "!is_live & url!*=/shorts/" --force-ipv4'
         self.in_custom_flags = QLineEdit(default_flags, dev_group)
+        self.in_custom_flags.setReadOnly(True)
+        
+        self.btn_open_flags = QPushButton("Personalizar Flags", dev_group)
+        self.btn_open_flags.clicked.connect(self._open_flags_editor)
+        
+        flags_layout = QHBoxLayout()
+        flags_layout.setContentsMargins(0, 0, 0, 0)
+        flags_layout.addWidget(self.in_custom_flags)
+        flags_layout.addWidget(self.btn_open_flags)
         
         dev_form.addRow("Template de Saída:", tmpl_layout)
         dev_form.addRow("Caminho FFmpeg:", ffmpeg_layout)
-        dev_form.addRow("Flags Personalizadas:", self.in_custom_flags)
+        dev_form.addRow("Flags Personalizadas:", flags_layout)
         
         adv_layout.addWidget(chk_group)
         adv_layout.addWidget(dev_group)
@@ -969,6 +1132,18 @@ class InspectorPanel(QFrame):
         self.in_date.textChanged.connect(self._update_dynamic_filename)
         self.in_output_tmpl.textChanged.connect(self._update_dynamic_filename)
         self.cb_container.currentTextChanged.connect(self._update_dynamic_filename)
+
+    @pyqtSlot()
+    def _open_flags_editor(self) -> None:
+        if sip.isdeleted(self.in_custom_flags): return
+        
+        current_state = self.in_custom_flags.text().strip()
+        dialog = EngineFlagsDialog(current_state, self)
+        
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            new_flags = dialog.compile_flags()
+            self.in_custom_flags.setText(new_flags)
+            logging.info("[Interface] Vetor de Flags mutado através do GUI Transacional.")
 
     @pyqtSlot()
     def _update_dynamic_filename(self) -> None:
