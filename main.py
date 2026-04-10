@@ -1147,7 +1147,6 @@ class InspectorPanel(QFrame):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             new_flags = dialog.compile_flags()
             self.in_custom_flags.setText(new_flags)
-            logging.info("[Interface] Vetor de Flags mutado através do GUI Transacional.")
 
     def load_from_config(self, config: Any) -> None:
         if getattr(config, 'media_type', None) == proc.MediaType.VIDEO:

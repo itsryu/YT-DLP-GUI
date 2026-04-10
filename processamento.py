@@ -1,4 +1,4 @@
-from ast import TypeVar
+import dataclasses
 from functools import wraps
 import logging
 import os
@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import Callable, Iterator, Optional, Any, TypedDict, Dict, List, cast
+from typing import TypeVar, Callable, Iterator, Optional, Any, TypedDict, Dict, List, cast
 
 HAS_CURL_CFFI = importlib.util.find_spec("curl_cffi") is not None
 if not HAS_CURL_CFFI:
@@ -28,7 +28,7 @@ if not HAS_CURL_CFFI:
 try:
     import yt_dlp  # type: ignore
     from yt_dlp.utils import DownloadError, YoutubeDLError  # type: ignore
-    from yt_dlp.networking.impersonate import ImpersonateTarget # type: ignore
+    from yt_dlp.networking.impersonate import ImpersonateTarget  # type: ignore
 except ImportError as e:
     raise ImportError(f"CRITICAL: Dependência yt-dlp não resolvida. {e}")
 
@@ -45,10 +45,15 @@ class MediaType(Enum):
     AUDIO = auto()
     VIDEO = auto()
 
+class CircuitBreakerState(Enum):
+    CLOSED = auto()
+    OPEN = auto()
+    HALF_OPEN = auto()
+
 T = TypeVar('T')
 
 class NetworkBlockedCDNError(Exception):
-    """ bloqueios na camada de transporte em CDN, característico de firewalls L7 """
+    """ Bloqueios na camada de transporte em CDN, característico de firewalls L7 """
     pass
 
 @dataclass(frozen=True)
@@ -291,44 +296,57 @@ class SpotifyToYTMAdapter:
         if not match: raise ValueError(f"Falha léxica ao extrair hash de {entity_type}.")
         return match.group(1)
 
+
 def exponential_backoff(retries: int = 3, base_delay: float = 2.0, max_delay: float = 30.0) -> Callable:
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
         @wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> T:
             attempt = 0
+            sleep_anterior = base_delay
             while attempt < retries:
-                try: return func(*args, **kwargs)
+                try: 
+                    return func(*args, **kwargs)
                 except Exception as e:
                     if "WAF" not in str(e) and "reload" not in str(e).lower() and attempt == retries - 1:
                         raise e
                     attempt += 1
-                    delay = min(max_delay, base_delay * (2 ** attempt))
-                    jitter = random.uniform(0, delay)
-                    logging.warning(f"[Network] Interceptação. Retentativa {attempt}/{retries} em {jitter:.2f}s. Erro: {e}")
-                    time.sleep(jitter)
+                    delay = min(max_delay, random.uniform(base_delay, sleep_anterior * 3))
+                    sleep_anterior = delay
+                    logging.warning(f"[Network] Interceptação. Retentativa {attempt}/{retries} em {delay:.2f}s. Erro: {e}")
+                    time.sleep(delay)
             raise RuntimeError(f"Exaustão da malha de rede após {retries} tentativas.")
         return wrapper
     return decorator
+
 
 class SessionStateManager:
     @staticmethod
     def create_ephemeral_cookie_jar() -> Optional[str]:
         central_cookie = Path("cookies.txt")
-        if not central_cookie.exists(): return None
+        if not central_cookie.exists(): 
+            return None
             
         try:
             fd, temp_path = tempfile.mkstemp(suffix=".txt", prefix="sndstream_session_")
             os.close(fd)
-            for attempt in range(5):
-                try:
-                    shutil.copy2(central_cookie, temp_path)
-                    return temp_path
-                except (PermissionError, OSError):
-                    if attempt == 4:
-                        logging.getLogger(__name__).warning("[I/O] Mutex Lock irrecuperável na matriz de cookies.")
-                        return None
-                    time.sleep(0.5 * (1.5 ** attempt))
-            return None
+            
+            with open(central_cookie, 'rb') as src, open(temp_path, 'wb') as dst:
+                if os.name == 'nt':
+                    import msvcrt
+                    msvcrt.locking(src.fileno(), msvcrt.LK_LOCK, os.path.getsize(central_cookie))
+                    try:
+                        shutil.copyfileobj(src, dst)
+                    finally:
+                        src.seek(0)
+                        msvcrt.locking(src.fileno(), msvcrt.LK_UNLCK, os.path.getsize(central_cookie))
+                else:
+                    import fcntl
+                    fcntl.flock(src.fileno(), fcntl.LOCK_SH)
+                    try:
+                        shutil.copyfileobj(src, dst)
+                    finally:
+                        fcntl.flock(src.fileno(), fcntl.LOCK_UN)
+            return temp_path
         except Exception as e:
             logging.getLogger(__name__).error(f"[I/O] Falha na alocação de Sandbox para sessão: {e}")
             return None
@@ -339,41 +357,82 @@ class SessionStateManager:
             try: os.unlink(path)
             except OSError: pass
 
+
 class TlsImpersonationProvider:
     _logger = logging.getLogger(__name__)
     _resolved_target: Optional[ImpersonateTarget] = None
     _TARGET_MATRIX: List[str] = ['chrome99', 'chrome104', 'chrome110', 'chrome116', 'chrome120', 'chrome124', 'chrome', 'safari_ios', 'firefox_102', 'firefox_115', 'firefox_120', 'firefox', 'edge_110', 'edge_116', 'edge_120', 'edge', 'android', 'ios', 'mweb', 'default']
     _is_cached: bool = False
+    _lock = threading.Lock()
 
     @classmethod
     def get_target(cls) -> Optional[ImpersonateTarget]:
         if cls._is_cached:
             return cls._resolved_target
 
-        if not HAS_CURL_CFFI:
+        with cls._lock:
+            if cls._is_cached:
+                return cls._resolved_target
+
+            if not HAS_CURL_CFFI:
+                cls._is_cached = True
+                return None
+
+            for client_name in cls._TARGET_MATRIX:
+                try:
+                    target = ImpersonateTarget(client=client_name)
+                    with yt_dlp.YoutubeDL({'impersonate': target, 'quiet': True}):
+                        pass
+                    
+                    cls._resolved_target = target
+                    cls._is_cached = True
+                    cls._logger.debug(f"[TLS] Handshake validado com sucesso usando target: {client_name}")
+                    return target
+                except Exception:
+                    continue
+            
+            cls._logger.error("[TLS] Exaustão total da matriz de personificação. Operando em modo padrão.")
             cls._is_cached = True
             return None
 
-        for client_name in cls._TARGET_MATRIX:
-            try:
-                target = ImpersonateTarget(client=client_name)
-                with yt_dlp.YoutubeDL({'impersonate': target, 'quiet': True}):
-                    pass
-                
-                cls._resolved_target = target
-                cls._is_cached = True
-                cls._logger.debug(f"[TLS] Handshake validado com sucesso usando target: {client_name}")
-                return target
-            except Exception:
-                continue
-        
-        cls._logger.error("[TLS] Exaustão total da matriz de personificação. Operando em modo padrão.")
-        cls._is_cached = True
-        return None
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 30.0):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self._state = CircuitBreakerState.CLOSED
+        self._failure_count = 0
+        self._last_failure_time = 0.0
+        self._lock = threading.Lock()
+
+    def execute(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+        with self._lock:
+            if self._state == CircuitBreakerState.OPEN:
+                if time.time() - self._last_failure_time > self.recovery_timeout:
+                    self._state = CircuitBreakerState.HALF_OPEN
+                else:
+                    raise NetworkBlockedCDNError("CircuitBreaker bloqueou a requisição devido a falhas sucessivas prévias.")
+
+        try:
+            result = func(*args, **kwargs)
+            with self._lock:
+                if self._state == CircuitBreakerState.HALF_OPEN:
+                    self._state = CircuitBreakerState.CLOSED
+                    self._failure_count = 0
+            return result
+        except Exception as e:
+            with self._lock:
+                self._failure_count += 1
+                self._last_failure_time = time.time()
+                if self._failure_count >= self.failure_threshold:
+                    self._state = CircuitBreakerState.OPEN
+            raise e
+
 
 class YtDlpService:
     URL_REGEX = re.compile(r'^(https?://)?(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com|vimeo\.com|soundcloud\.com|open\.spotify\.com)/.+$')
     _network_semaphore = threading.BoundedSemaphore(value=5)
+    _circuit_breaker = CircuitBreaker(failure_threshold=4, recovery_timeout=45.0)
 
     @staticmethod
     def validate_url(url: str) -> bool:
@@ -405,28 +464,32 @@ class YtDlpService:
         if target:
             ydl_opts_base['impersonate'] = target
 
-        with cls._network_semaphore:
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts_base) as ydl:
-                    return cast(YtDlpExtractedInfo, ydl.extract_info(url, download=False))
-            except DownloadError as e:
-                error_msg = str(e).lower()
-                if any(kw in error_msg for kw in ["sign in", "members only", "private", "age", "bot", "reloaded"]):
-                    ephemeral_cookie = SessionStateManager.create_ephemeral_cookie_jar()
-                    if not ephemeral_cookie: raise e 
-                    ydl_opts_fallback = ydl_opts_base.copy()
-                    ydl_opts_fallback['cookiefile'] = ephemeral_cookie
-                    try:
-                        with yt_dlp.YoutubeDL(ydl_opts_fallback) as ydl_fallback:
-                            return cast(YtDlpExtractedInfo, ydl_fallback.extract_info(url, download=False))
-                    finally:
-                        SessionStateManager.cleanup_ephemeral_cookie_jar(ephemeral_cookie)
-                else: raise
+        def do_extraction() -> YtDlpExtractedInfo:
+            with cls._network_semaphore:
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts_base) as ydl:
+                        return cast(YtDlpExtractedInfo, ydl.extract_info(url, download=False))
+                except DownloadError as e:
+                    error_msg = str(e).lower()
+                    if any(kw in error_msg for kw in ["sign in", "members only", "private", "age", "bot", "reloaded"]):
+                        ephemeral_cookie = SessionStateManager.create_ephemeral_cookie_jar()
+                        if not ephemeral_cookie: raise e 
+                        ydl_opts_fallback = ydl_opts_base.copy()
+                        ydl_opts_fallback['cookiefile'] = ephemeral_cookie
+                        try:
+                            with yt_dlp.YoutubeDL(ydl_opts_fallback) as ydl_fallback:
+                                return cast(YtDlpExtractedInfo, ydl_fallback.extract_info(url, download=False))
+                        finally:
+                            SessionStateManager.cleanup_ephemeral_cookie_jar(ephemeral_cookie)
+                    else: raise
+
+        return cls._circuit_breaker.execute(do_extraction)
 
     @classmethod
     def fetch_thumbnail_bytes_sync(cls, url: str) -> Optional[bytes]:
         ctx = ssl.create_default_context()
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        
         for attempt in range(3):
             try:
                 with urllib.request.urlopen(req, timeout=15, context=ctx) as response:
@@ -444,6 +507,7 @@ class YtDlpService:
                 logging.warning(f"[I/O] Retentativa {attempt+1}/3 na aquisição de miniatura: {e}")
                 time.sleep(1)
         return None
+
 
 class AnalysisWorker(QRunnable):
     def __init__(self, url: str) -> None:
@@ -486,8 +550,8 @@ class AnalysisWorker(QRunnable):
             is_playlist=False, upload_date=info.get('upload_date'), description=info.get('description'),
             width=info.get('width'), height=info.get('height'), fps=info.get('fps'), channel=info.get('channel') or info.get('uploader')
         )
-        object.__setattr__(entity, "filesize", info.get('filesize_approx') or info.get('filesize') or 0)
-        return entity
+        return dataclasses.replace(entity, filesize=info.get('filesize_approx') or info.get('filesize') or 0)
+
 
 class PlaylistDispatcher:
     def __init__(self, thread_pool: QThreadPool) -> None:
@@ -519,6 +583,7 @@ class PlaylistDispatcher:
         )
         self.thread_pool.start(DownloadWorker(thread_safe_config))
 
+
 class YtDlpInterceptorLogger:
     def __init__(self, job_id: str, check_abort_callback: Any) -> None:
         self.job_id = job_id
@@ -529,6 +594,7 @@ class YtDlpInterceptorLogger:
     def info(self, msg: str) -> None: self._check_abort(); self.logger.info(msg)
     def warning(self, msg: str) -> None: self._check_abort(); self.logger.warning(msg)
     def error(self, msg: str) -> None: self._check_abort(); self.logger.error(msg)
+
 
 class SubprocessDSPEngine:
     @staticmethod
@@ -578,19 +644,25 @@ class SubprocessDSPEngine:
         if audio_filters: cmd.extend(['-af', ','.join(audio_filters)])
             
         if config.embed_metadata:
-            def sanitize(val: str) -> str: return str(val).replace('\r\n', ' ').replace('\n', ' ').replace('"', "'").strip()
-            title = sanitize(config.meta_title or info_dict.get('title', ''))
-            artist = sanitize(config.meta_artist or info_dict.get('uploader', ''))
+            title = str(config.meta_title or info_dict.get('title', '')).strip()
+            artist = str(config.meta_artist or info_dict.get('uploader', '')).strip()
+            album = str(config.meta_album or '').strip()
+            genre = str(config.meta_genre or '').strip()
+            desc = str(config.meta_desc or '').strip()
+            
             cmd.extend([
-                '-metadata', f"title={title}", '-metadata', f"artist={artist}", '-metadata', f"album_artist={artist}",
-                '-metadata', f"album={sanitize(config.meta_album)}", '-metadata', f"genre={sanitize(config.meta_genre)}",
-                '-metadata', f"comment={sanitize(config.meta_desc)}",
+                '-metadata', f"title={title}",
+                '-metadata', f"artist={artist}",
+                '-metadata', f"album_artist={artist}",
+                '-metadata', f"album={album}",
+                '-metadata', f"genre={genre}",
+                '-metadata', f"comment={desc}",
             ])
-            if config.meta_date: cmd.extend(['-metadata', f"date={sanitize(config.meta_date[:4])}"])
+            if config.meta_date: cmd.extend(['-metadata', f"date={str(config.meta_date[:4]).strip()}"])
                 
         if cover_target_path:
             cmd.extend(['-map', '0:a:0', '-map', '1:v:0', '-c:v', 'mjpeg', '-disposition:v', 'attached_pic'])
-            if ext == 'mp3': cmd.extend(['-id3v2_version', '3', '-metadata:s:v', 'title="Album cover"', '-metadata:s:v', 'comment="Cover (front)"'])
+            if ext == 'mp3': cmd.extend(['-id3v2_version', '3', '-metadata:s:v', 'title=Album cover', '-metadata:s:v', 'comment=Cover (front)'])
         else: cmd.extend(['-map', '0:a:0'])
         
         cmd.append(str(out_filepath))
@@ -599,7 +671,7 @@ class SubprocessDSPEngine:
             startupinfo = subprocess.STARTUPINFO() if os.name == 'nt' else None
             if startupinfo: startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True, startupinfo=startupinfo)
-        except FileNotFoundError as e:
+        except FileNotFoundError:
             raise RuntimeError("Motor DSP (FFmpeg) ausente do PATH do sistema operativo.")
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"Falha na execução FFmpeg: {e.stderr}")
@@ -612,33 +684,35 @@ class SubprocessDSPEngine:
             if raw_filepath.exists() and raw_filepath.absolute() != out_filepath.absolute(): safe_delete(raw_filepath)
             if cover_target_path and "cover_art_fallback" in cover_target_path.name: safe_delete(cover_target_path)
 
+
 class DownloadWorker(QRunnable):
     def __init__(self, config: DownloadJobConfig) -> None:
         super().__init__()
-        self.config = config
         
-        if not self.config.custom_filename or self.config.custom_filename.lower() in ["output", ""]:
-            tmpl = self.config.output_template if self.config.output_template else "%(title)s - %(artist)s"
+        if not config.custom_filename or config.custom_filename.lower() in ["output", ""]:
+            tmpl = config.output_template if config.output_template else "%(title)s - %(artist)s"
             
             def safe_sub(pattern: str, val: str, tmpl_str: str) -> str:
                 return tmpl_str.replace(pattern, re.sub(r'[<>:"/\\|?*]', '', str(val))) if val else tmpl_str
             
-            res = safe_sub('%(title)s', self.config.meta_title, tmpl)
-            res = safe_sub('%(artist)s', self.config.meta_artist, res)
-            res = safe_sub('%(uploader)s', self.config.meta_artist, res)
-            res = safe_sub('%(album)s', self.config.meta_album, res)
-            res = safe_sub('%(genre)s', self.config.meta_genre, res)
+            res = safe_sub('%(title)s', config.meta_title, tmpl)
+            res = safe_sub('%(artist)s', config.meta_artist, res)
+            res = safe_sub('%(uploader)s', config.meta_artist, res)
+            res = safe_sub('%(album)s', config.meta_album, res)
+            res = safe_sub('%(genre)s', config.meta_genre, res)
             
-            if self.config.meta_date:
-                res = safe_sub('%(release_year)s', self.config.meta_date[:4], res)
-                res = safe_sub('%(upload_date)s', self.config.meta_date[:4], res)
+            if config.meta_date:
+                res = safe_sub('%(release_year)s', config.meta_date[:4], res)
+                res = safe_sub('%(upload_date)s', config.meta_date[:4], res)
             
             res = re.sub(r'%\([^)]+\)s', '', res)
             res = re.sub(r'\s+', ' ', res).strip()
             res = res.strip('- ')
             
             final_name = res or "output_stream"
-            object.__setattr__(self.config, "custom_filename", final_name)
+            self.config = dataclasses.replace(config, custom_filename=final_name)
+        else:
+            self.config = config
 
         self._signals = WorkerSignals()
         self.broker = PyQtMessageBroker(self._signals)
@@ -847,8 +921,11 @@ class DownloadWorker(QRunnable):
                         
         if moved_files:
             target_audio = next((f for f in moved_files if f.suffix.lower() == f".{self.config.format_container.lower()}"), moved_files[0])
-            object.__setattr__(self.config, "resolved_output_path", str(target_audio))
-            object.__setattr__(self.config, "custom_filename", target_audio.stem)
+            self.config = dataclasses.replace(
+                self.config, 
+                resolved_output_path=str(target_audio), 
+                custom_filename=target_audio.stem
+            )
 
     @pyqtSlot()
     def run(self) -> None:
@@ -863,16 +940,19 @@ class DownloadWorker(QRunnable):
                     if image.loadFromData(response.read()):
                         temp_cover = Path(tempfile.gettempdir()) / f"spotify_cover_{uuid.uuid4().hex[:8]}.jpg"
                         image.convertToFormat(QImage.Format.Format_RGB32).save(str(temp_cover), "JPG", 95)
-                        object.__setattr__(self.config, "custom_cover_path", str(temp_cover))
+                        self.config = dataclasses.replace(self.config, custom_cover_path=str(temp_cover))
             except Exception: pass
 
         try:
             ydl_opts = self._build_ydl_opts()
-            with YtDlpService._network_semaphore:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    self.broker.emit_status(self.config.job_id, "Iniciando stream binário...")
-                    info_dict = ydl.extract_info(self.config.url, download=True)
             
+            def do_download():
+                with YtDlpService._network_semaphore:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        self.broker.emit_status(self.config.job_id, "Iniciando stream binário...")
+                        return ydl.extract_info(self.config.url, download=True)
+            
+            info_dict = YtDlpService._circuit_breaker.execute(do_download)
             self._check_abort()
             
             if self.config.media_type == MediaType.AUDIO:
@@ -906,11 +986,10 @@ class DownloadWorker(QRunnable):
                     final_name = f"{self.config.custom_filename}.{self.config.format_container}"
                     target_path = self.config.output_path / final_name
                     if target_path.exists():
-                        object.__setattr__(self.config, "resolved_output_path", str(target_path))
+                        self.config = dataclasses.replace(self.config, resolved_output_path=str(target_path))
                     elif (files := list(self.config.output_path.glob(f"*.{self.config.format_container}"))):
                         latest = max(files, key=lambda f: f.stat().st_mtime)
-                        object.__setattr__(self.config, "resolved_output_path", str(latest))
-                        object.__setattr__(self.config, "custom_filename", latest.stem)
+                        self.config = dataclasses.replace(self.config, resolved_output_path=str(latest), custom_filename=latest.stem)
             except Exception: pass
             
             self.broker.emit_finished()
