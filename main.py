@@ -172,24 +172,20 @@ class EngineFlagsDialog(QDialog):
 
     def _initialize_registry(self) -> List[EngineFlag]:
         return [
-            # Domínio: Rede e Transporte
             EngineFlag("--force-ipv4", "Forçar resolução de sockets via IPv4", category="Rede e Transporte"),
             EngineFlag("--force-ipv6", "Forçar resolução de sockets via IPv6", category="Rede e Transporte"),
             EngineFlag("--limit-rate", "Limitar largura de banda (ex: 50K, 2M)", requires_input=True, category="Rede e Transporte"),
             EngineFlag("--proxy", "URI de Proxy HTTP/SOCKS", requires_input=True, category="Rede e Transporte"),
             EngineFlag("--socket-timeout", "Tempo limite de resposta (Time-to-Live) em segundos", requires_input=True, category="Rede e Transporte"),
             
-            # Domínio: Evasão e Falsificação
             EngineFlag("--geo-bypass", "Contornar restrições geográficas via cabeçalhos injetados", category="Evasão de Restrições"),
             EngineFlag("--cookies-from-browser", "Extrair matriz de estado (Cookies) do navegador (ex: chrome, firefox)", requires_input=True, category="Evasão de Restrições"),
             EngineFlag("--user-agent", "Falsificação estrita da string de User-Agent", requires_input=True, category="Evasão de Restrições"),
             
-            # Domínio: Regulação de Fluxo e Sincronismo
             EngineFlag("--sleep-requests", "Atraso determinístico entre requisições iterativas (segundos)", requires_input=True, category="Regulação de Fluxo"),
             EngineFlag("--sleep-interval", "Atraso limite inferior (randômico) entre transações (segundos)", requires_input=True, category="Regulação de Fluxo"),
             EngineFlag("--max-sleep-interval", "Atraso limite superior (randômico) entre transações (segundos)", requires_input=True, category="Regulação de Fluxo"),
             
-            # Domínio: Operações de Sistema de Arquivos
             EngineFlag("--ignore-errors", "Ignorar exceções isoladas e manter topologia contínua", category="Sistema de Arquivos"),
             EngineFlag("--no-warnings", "Suprimir pipeline de avisos no STDERR", category="Sistema de Arquivos"),
             EngineFlag("--restrict-filenames", "Normalizar nomenclatura para o padrão ASCII (suprime espaços e caracteres especiais)", category="Sistema de Arquivos"),
@@ -197,20 +193,17 @@ class EngineFlagsDialog(QDialog):
             EngineFlag("--no-overwrites", "Bloquear sobrescrita (Skip) em partições alocadas previamente", category="Sistema de Arquivos"),
             EngineFlag("--continue", "Forçar a retoma explícita de blocos binários não consolidados", category="Sistema de Arquivos"),
             
-            # Domínio: Processamento Estrutural em Árvore
             EngineFlag("--match-filter", "Filtro booleano AST (ex: !is_live & url!*=/shorts/)", requires_input=True, category="Processamento Estrutural"),
             EngineFlag("--playlist-reverse", "Inverter a fila do algoritmo de busca (LIFO)", category="Processamento Estrutural"),
             EngineFlag("--break-on-existing", "Interromper Thread ao encontrar nó persistido (Otimiza rotinas de sincronização)", category="Processamento Estrutural"),
             EngineFlag("--max-downloads", "Limite quantitativo absoluto de nós a extrair", requires_input=True, category="Processamento Estrutural"),
             
-            # Domínio: Injeção de Metadados
             EngineFlag("--write-subs", "Efetuar I/O de legendas nativas", category="Metadados e Telemetria"),
             EngineFlag("--write-auto-subs", "Sintetizar matriz de legendas automáticas (ASR)", category="Metadados e Telemetria"),
             EngineFlag("--sub-langs", "Vetor ISO de segmentação de idiomas (ex: en,pt)", requires_input=True, category="Metadados e Telemetria"),
             EngineFlag("--embed-chapters", "Injetar matriz estrutural de capítulos via multiplexador (FFmpeg)", category="Metadados e Telemetria"),
             EngineFlag("--write-info-json", "Descarregar manifesto RAW (JSON) de telemetria da entidade", category="Metadados e Telemetria"),
             
-            # Domínio: Acesso de Baixo Nível
             EngineFlag("--extractor-args", "Injeção nativa de dependências lógicas ao módulo base (ex: youtube:player_client=android)", requires_input=True, category="Baixo Nível")
         ]
 
@@ -1148,7 +1141,7 @@ class InspectorPanel(QFrame):
             new_flags = dialog.compile_flags()
             self.in_custom_flags.setText(new_flags)
 
-    def load_from_config(self, config: Any) -> None:
+    def load_from_config(self, config: Any, state: Any = None) -> None:
         if getattr(config, 'media_type', None) == proc.MediaType.VIDEO:
             self.rb_video.setChecked(True)
         else:
@@ -1232,8 +1225,9 @@ class InspectorPanel(QFrame):
         self._current_meta = MockEntity(config)
         self._current_source_url = getattr(config, 'url', '')
 
-        if hasattr(config, 'custom_cover_path') and config.custom_cover_path:
-            path = Path(config.custom_cover_path)
+        cover_path = getattr(state, 'custom_cover_path', None) if state else getattr(config, 'custom_cover_path', None)
+        if cover_path:
+            path = Path(cover_path)
             if path.exists():
                 self._local_custom_cover_path = str(path)
                 self.set_thumbnail(QPixmap(str(path)))
@@ -1724,6 +1718,7 @@ class MainWindow(QMainWindow):
         
         self.active_runnables: Dict[str, proc.DownloadWorker] = {}
         self.job_configs: Dict[str, proc.DownloadJobConfig] = {}
+        self.job_states: Dict[str, proc.DownloadJobState] = {}
         self._terminal_jobs: Set[str] = set()
         
         self._current_meta: Optional[proc.NormalizedMediaEntity] = None
@@ -1962,13 +1957,13 @@ class MainWindow(QMainWindow):
 
     def _edit_local_metadata(self, job_id: str) -> None:
         config = self.job_configs.get(job_id)
-        if not config: return
+        state = self.job_states.get(job_id)
+        if not config or not state: return
         
-        resolved_path_str = getattr(config, 'resolved_output_path', None)
-        if resolved_path_str and Path(resolved_path_str).exists():
-            filepath = Path(resolved_path_str)
+        if state.resolved_output_path and Path(state.resolved_output_path).exists():
+            filepath = Path(state.resolved_output_path)
         else:
-            safe_name = re.sub(r'[\\/*?:"<>|]', '_', config.custom_filename)
+            safe_name = re.sub(r'[\\/*?:"<>|]', '_', state.custom_filename)
             filepath = Path(config.output_path) / f"{safe_name}.{config.format_container}"
             if not filepath.exists():
                 candidates = list(Path(config.output_path).glob(f"*.{config.format_container}"))
@@ -1990,15 +1985,18 @@ class MainWindow(QMainWindow):
             
         dialog = LocalMetadataEditorDialog(str(filepath), initial_data, self)
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.new_filepath:
-            object.__setattr__(config, "custom_filename", dialog.new_filepath.stem)
-            object.__setattr__(config, "resolved_output_path", str(dialog.new_filepath))
+            state.custom_filename = dialog.new_filepath.stem
+            state.resolved_output_path = str(dialog.new_filepath)
             
-            object.__setattr__(config, "meta_title", dialog.in_title.text())
-            object.__setattr__(config, "meta_artist", dialog.in_artist.text())
-            object.__setattr__(config, "meta_album", dialog.in_album.text())
-            object.__setattr__(config, "meta_genre", dialog.in_genre.text())
-            object.__setattr__(config, "meta_date", dialog.in_date.text())
-            object.__setattr__(config, "meta_desc", dialog.in_desc.toPlainText())
+            new_config = replace(config,
+                meta_title=dialog.in_title.text(),
+                meta_artist=dialog.in_artist.text(),
+                meta_album=dialog.in_album.text(),
+                meta_genre=dialog.in_genre.text(),
+                meta_date=dialog.in_date.text(),
+                meta_desc=dialog.in_desc.toPlainText()
+            )
+            self.job_configs[job_id] = new_config
             
             row = self.get_row_by_id(job_id)
             if row >= 0:
@@ -2014,6 +2012,8 @@ class MainWindow(QMainWindow):
             
         if job_id in self.job_configs:
             del self.job_configs[job_id]
+        if job_id in self.job_states:
+            del self.job_states[job_id]
             
         row = self.get_row_by_id(job_id)
         if row >= 0:
@@ -2026,6 +2026,8 @@ class MainWindow(QMainWindow):
                 job_id = self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
                 if job_id in self.job_configs:
                     del self.job_configs[job_id]
+                if job_id in self.job_states:
+                    del self.job_states[job_id]
                 self.table.removeRow(row)
 
     def toggle_dev_mode(self, checked: bool) -> None:
@@ -2198,7 +2200,10 @@ class MainWindow(QMainWindow):
                 quality_preset=data['quality_preset'],
                 audio_sample_rate=data['audio_sample_rate'],
                 audio_bitrate=str(data['audio_bitrate']),
-                custom_filename=resolved_filename,
+                audio_bit_depth=data.get('audio_bit_depth', 'auto'),
+                output_template=data.get('output_template', ''),
+                ffmpeg_path=data.get('ffmpeg_path', ''),
+                custom_flags=data.get('custom_flags', ''),
                 meta_title=final_title,
                 meta_artist=final_artist,
                 meta_album=final_album,
@@ -2209,23 +2214,22 @@ class MainWindow(QMainWindow):
                 embed_thumbnail=data['embed_thumb'],
                 embed_subs=data['embed_subs'],
                 normalize_audio=data['norm_audio'],
-                use_browser_cookies=data['use_cookies']
+                use_browser_cookies=data['use_cookies'],
+                spotify_thumb_url=getattr(entity, 'thumbnail_url', None)
             )
-            
-            object.__setattr__(config, "audio_bit_depth", data.get('audio_bit_depth', 'auto'))
-            object.__setattr__(config, "output_template", data.get('output_template', ''))
-            object.__setattr__(config, "ffmpeg_path", data.get('ffmpeg_path', ''))
-            object.__setattr__(config, "custom_flags", data.get('custom_flags', ''))
-
-            object.__setattr__(config, "spotify_thumb_url", getattr(entity, 'thumbnail_url', None))
 
             user_local_cover = data.get('local_custom_cover', '')
             analysis_cover = self._analysis_cover_path
             final_cover = user_local_cover if user_local_cover else analysis_cover
-            object.__setattr__(config, "custom_cover_path", str(final_cover) if final_cover else "")
+            
+            state = proc.DownloadJobState(
+                custom_filename=resolved_filename,
+                custom_cover_path=str(final_cover) if final_cover else None
+            )
             
             self.job_configs[job_id] = config
-            self._spawn_download(config, is_retry=False)
+            self.job_states[job_id] = state
+            self._spawn_download(config, state, is_retry=False)
         
         if not sip.isdeleted(self.inspector):
             self.inspector.setVisible(False)
@@ -2238,14 +2242,15 @@ class MainWindow(QMainWindow):
             self._terminal_jobs.remove(job_id)
             
         config = self.job_configs.get(job_id)
-        if not config: return
+        state = self.job_states.get(job_id)
+        if not config or not state: return
         
         self.url_input.blockSignals(True)
         self.url_input.setText(config.url)
         self.url_input.blockSignals(False)
         
         if not sip.isdeleted(self.inspector):
-            self.inspector.load_from_config(config)
+            self.inspector.load_from_config(config, state)
             self._current_meta = self.inspector._current_meta 
             self.inspector.setVisible(True)
             
@@ -2255,8 +2260,10 @@ class MainWindow(QMainWindow):
         self._remove_from_queue(job_id)
         
 
-    def _spawn_download(self, config: proc.DownloadJobConfig, is_retry: bool = False) -> None:
+    def _spawn_download(self, config: proc.DownloadJobConfig, state: proc.DownloadJobState, is_retry: bool = False) -> None:
         runnable = proc.DownloadWorker(config)
+        runnable.state = state
+        
         runnable.signals.progress.connect(self.update_progress)
         runnable.signals.status.connect(self.update_status)
         runnable.signals.finished.connect(lambda: self.on_job_finished(config.job_id))
@@ -2268,7 +2275,7 @@ class MainWindow(QMainWindow):
             if row >= 0:
                 self._reset_row_for_retry(row, config.job_id)
         else:
-            self.add_table_row(config)
+            self.add_table_row(config, state)
             
         self.thread_pool.start(runnable)
 
@@ -2285,11 +2292,11 @@ class MainWindow(QMainWindow):
         
         self.table.setCellWidget(row, 4, container)
 
-    def add_table_row(self, config: proc.DownloadJobConfig) -> None:
+    def add_table_row(self, config: proc.DownloadJobConfig, state: proc.DownloadJobState) -> None:
         row = self.table.rowCount()
         self.table.insertRow(row)
         
-        display_name = config.custom_filename if config.custom_filename else "Em processamento"
+        display_name = state.custom_filename if state.custom_filename else "Em processamento"
         if display_name and config.format_container:
             display_name = f"{display_name}.{config.format_container}"
             
@@ -2403,10 +2410,11 @@ class MainWindow(QMainWindow):
                 item.setForeground(color)
             
             config = self.job_configs.get(job_id)
-            if config and getattr(config, 'custom_filename', None):
+            state = self.job_states.get(job_id)
+            if config and state and state.custom_filename:
                 title_item = self.table.item(row, 0)
                 if title_item is not None:
-                    title_item.setText(f"{config.custom_filename}.{config.format_container}")
+                    title_item.setText(f"{state.custom_filename}.{config.format_container}")
 
             if "Concluído" in status_text: 
                 widget = self.table.cellWidget(row, 3)
