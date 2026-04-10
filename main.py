@@ -13,7 +13,9 @@ import time
 import ssl
 import subprocess
 import shutil
-from dataclasses import dataclass, replace
+import tempfile
+import copy
+from dataclasses import dataclass, field, replace
 from typing import Callable, Final, Dict, Any, Optional, List, TypeVar, Set
 from pathlib import Path
 from functools import wraps
@@ -28,12 +30,11 @@ from PyQt6.QtWidgets import (
     QButtonGroup, QAbstractItemView, QMenu, QDialog, QDialogButtonBox,
     QTableView
 )
-from PyQt6.QtCore import Qt, QObject, pyqtSignal, QThreadPool, pyqtSlot, QUrl, QRunnable, QTimer, QAbstractTableModel, QModelIndex
+from PyQt6.QtCore import Qt, QObject, pyqtSignal, QThreadPool, pyqtSlot, QUrl, QRunnable, QTimer, QAbstractTableModel, QModelIndex, QSettings
 from PyQt6.QtGui import QColor, QPixmap, QFont, QTextCursor, QTextCharFormat, QDesktopServices, QPalette, QAction, QCloseEvent, QImage
 from PyQt6 import sip
 
 import processamento as proc
-
 
 PROJECT_DIR = str(Path(__file__).parent.absolute())
 if PROJECT_DIR not in os.environ.get("PATH", ""):
@@ -42,9 +43,151 @@ if PROJECT_DIR not in os.environ.get("PATH", ""):
 T = TypeVar('T')
 
 APP_NAME: Final[str] = "SoundStream Pro"
-VERSION: Final[str] = "7.10.2"
+VERSION: Final[str] = "7.10.3"
 DEFAULT_DOWNLOAD_DIR: Final[Path] = Path.home() / "Downloads"
 MAX_CONCURRENT_DOWNLOADS: Final[int] = 3
+
+MB_CONTACT = os.environ.get("MB_CONTACT_EMAIL", "contact@soundstream.app")
+MB_USER_AGENT = f"{APP_NAME}/{VERSION} ( {MB_CONTACT} )"
+
+_SHARED_SSL_CTX: ssl.SSLContext = ssl.create_default_context()
+
+@dataclass(frozen=True)
+class EntityStub:
+    original_id: str = ''
+    title: str = ''
+    artist: str = ''
+    album: str = ''
+    duration: float = 0.0
+    filesize: int = 0
+    is_playlist: bool = False
+    children: List[Any] = field(default_factory=list)
+    is_search_query: bool = False
+    width: Optional[int] = None
+    height: Optional[int] = None
+    fps: Optional[float] = None
+    channel: str = 'Desconhecido'
+    upload_date: str = ''
+    description: str = ''
+    thumbnail_url: Optional[str] = None
+    genre: str = ''
+
+    @property
+    def display_duration(self) -> str:
+        safe_duration = int(float(self.duration)) if self.duration else 0
+        if safe_duration <= 0: return "N/A"
+        minutes, seconds = divmod(safe_duration, 60)
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}" if hours > 0 else f"{minutes:02d}:{seconds:02d}"
+
+@dataclass
+class JobRecord:
+    config: proc.DownloadJobConfig
+    state: proc.DownloadJobState
+    runnable: Optional[proc.DownloadWorker] = None
+    is_terminal: bool = False
+
+def with_exponential_backoff(max_retries: int = 3, base_delay: float = 1.0) -> Callable:
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            attempt = 0
+            while attempt < max_retries:
+                try:
+                    return func(*args, **kwargs)
+                except (urllib.error.URLError, ssl.SSLError, ConnectionError) as e:
+                    error_msg = str(e)
+                    if "UNEXPECTED_EOF" in error_msg or "EOF occurred" in error_msg or "Connection reset" in error_msg:
+                        attempt += 1
+                        if attempt >= max_retries:
+                            raise
+                        delay = base_delay * (2 ** attempt)
+                        logging.warning(f"[Network] Interrupção prematura de TCP/TLS. Retentativa {attempt}/{max_retries} pendente (Atraso: {delay}s).")
+                        time.sleep(delay)
+                    else:
+                        raise
+        return wrapper
+    return decorator
+
+class UrlResolver:
+    @staticmethod
+    def resolve_download_url(entity: Any, target_url: str) -> str:
+        if getattr(entity, 'is_search_query', False) or target_url.startswith("ytmsearch") or target_url.startswith("ytsearch"):
+            query = target_url.split(":", 1)[-1] if ":" in target_url else target_url
+            return f'ytsearch5:{query.strip()} "Provided to YouTube"'
+        elif not target_url.startswith("http") and not target_url.startswith("ytsearch"):
+            return f"https://www.youtube.com/watch?v={target_url}"
+        return target_url
+
+class CookieImportSignals(QObject):
+    success = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+class CookieImportWorker(QRunnable):
+    def __init__(self, source_path: str) -> None:
+        super().__init__()
+        self.source_path = Path(source_path)
+        self.signals = CookieImportSignals()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            with open(self.source_path, "r", encoding="utf-8", errors="ignore") as f:
+                if "# Netscape HTTP Cookie File" not in f.read(120):
+                    self.signals.error.emit("A assinatura léxica do ficheiro não corresponde à RFC 'Netscape HTTP Cookie File'. A importação foi abortada.")
+                    return
+            
+            target_path = Path.cwd() / "cookies.txt"
+            shutil.copy2(self.source_path, target_path)
+            self.signals.success.emit(str(target_path.absolute()))
+        except Exception as e:
+            self.signals.error.emit(f"Falha de I/O não tratada: {str(e)}")
+
+class MetadataDSPSignals(QObject):
+    success = pyqtSignal(Path)
+    error = pyqtSignal(str)
+
+class MetadataDSPWorker(QRunnable):
+    def __init__(self, cmd: List[str], temp_out: Path, target_filepath: Path, original_filepath: Path) -> None:
+        super().__init__()
+        self.cmd = cmd
+        self.temp_out = temp_out
+        self.target_filepath = target_filepath
+        self.original_filepath = original_filepath
+        self.signals = MetadataDSPSignals()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        startupinfo = None
+        if os.name == 'nt':
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            
+        try:
+            file_size = self.original_filepath.stat().st_size
+            is_stream_copy = "-c copy" in " ".join(self.cmd)
+            timeout_sec = 300 if is_stream_copy else max(120, int(file_size / (512 * 1024)))
+            
+            subprocess.run(self.cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True, startupinfo=startupinfo, timeout=timeout_sec)
+            
+            if self.target_filepath.exists() and self.target_filepath.absolute() != self.original_filepath.absolute():
+                self.target_filepath.unlink(missing_ok=True)
+                
+            shutil.move(str(self.temp_out), str(self.target_filepath))
+            
+            if self.target_filepath.absolute() != self.original_filepath.absolute():
+                self.original_filepath.unlink(missing_ok=True)
+                
+            self.signals.success.emit(self.target_filepath)
+        except subprocess.TimeoutExpired:
+            if self.temp_out.exists(): self.temp_out.unlink()
+            self.signals.error.emit("A transcodificação atómica excedeu o tempo limite.")
+        except subprocess.CalledProcessError as e:
+            if self.temp_out.exists(): self.temp_out.unlink()
+            self.signals.error.emit(f"Kernel Panic (FFmpeg):\n{e.stderr}")
+        except Exception as e:
+            if self.temp_out.exists(): self.temp_out.unlink()
+            self.signals.error.emit(str(e))
 
 class LocalMetadataEditorDialog(QDialog):
     def __init__(self, filepath: str, initial_data: Dict[str, str], parent: Optional[QWidget] = None) -> None:
@@ -86,15 +229,14 @@ class LocalMetadataEditorDialog(QDialog):
         scroll.setWidget(content)
         layout.addWidget(scroll)
         
-        lbl_info = QLabel("Nota: A reescrita efetua-se via <b>Stream Copy</b> atómico. O ficheiro original será substituído de imediato e a nomenclatura atualizada a nível do Sistema Operativo.")
-        lbl_info.setWordWrap(True)
+        lbl_info = QLabel("Nota: A reescrita efetua-se via <b>Stream Copy</b> atómico em background.")
         lbl_info.setStyleSheet("color: gray; font-size: 11px;")
         layout.addWidget(lbl_info)
         
-        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
-        btn_box.accepted.connect(self._apply_metadata)
-        btn_box.rejected.connect(self.reject)
-        layout.addWidget(btn_box)
+        self.btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        self.btn_box.accepted.connect(self._apply_metadata)
+        self.btn_box.rejected.connect(self.reject)
+        layout.addWidget(self.btn_box)
 
     def _apply_metadata(self) -> None:
         if not self.filepath.exists():
@@ -120,35 +262,24 @@ class LocalMetadataEditorDialog(QDialog):
         add_meta("date", self.in_date.text()[:4])
         add_meta("comment", self.in_desc.toPlainText())
         add_meta("description", self.in_desc.toPlainText())
-        
         cmd.append(str(temp_out))
         
-        startupinfo = None
-        if os.name == 'nt':
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            
-        try:
-            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True, startupinfo=startupinfo)
-            
-            if target_filepath.exists() and target_filepath.absolute() != self.filepath.absolute():
-                target_filepath.unlink(missing_ok=True)
-                
-            shutil.move(str(temp_out), str(target_filepath))
-            
-            if target_filepath.absolute() != self.filepath.absolute():
-                self.filepath.unlink(missing_ok=True)
-                
-            self.new_filepath = target_filepath
-            QMessageBox.information(self, "Transação Concluída", "Mutação de metadados e topologia de nomenclatura consolidada com êxito.")
-            self.accept()
-            
-        except subprocess.CalledProcessError as e:
-            if temp_out.exists(): temp_out.unlink()
-            QMessageBox.critical(self, "Kernel Panic (FFmpeg)", f"A transcodificação atómica colapsou.\n\nDetalhes do Processo:\n{e.stderr}")
-        except Exception as e:
-            if temp_out.exists(): temp_out.unlink()
-            QMessageBox.critical(self, "Exceção não Tratada de I/O", str(e))
+        self.btn_box.setEnabled(False)
+        worker = MetadataDSPWorker(cmd, temp_out, target_filepath, self.filepath)
+        worker.signals.success.connect(self._on_success)
+        worker.signals.error.connect(self._on_error)
+        QThreadPool.globalInstance().start(worker)
+
+    @pyqtSlot(Path)
+    def _on_success(self, target: Path) -> None:
+        self.new_filepath = target
+        QMessageBox.information(self, "Transação Concluída", "Mutação de metadados consolidada com êxito.")
+        self.accept()
+
+    @pyqtSlot(str)
+    def _on_error(self, err: str) -> None:
+        self.btn_box.setEnabled(True)
+        QMessageBox.critical(self, "Erro I/O", err)
 
 @dataclass(frozen=True)
 class EngineFlag:
@@ -177,43 +308,35 @@ class EngineFlagsDialog(QDialog):
             EngineFlag("--limit-rate", "Limitar largura de banda (ex: 50K, 2M)", requires_input=True, category="Rede e Transporte"),
             EngineFlag("--proxy", "URI de Proxy HTTP/SOCKS", requires_input=True, category="Rede e Transporte"),
             EngineFlag("--socket-timeout", "Tempo limite de resposta (Time-to-Live) em segundos", requires_input=True, category="Rede e Transporte"),
-            
             EngineFlag("--geo-bypass", "Contornar restrições geográficas via cabeçalhos injetados", category="Evasão de Restrições"),
-            EngineFlag("--cookies-from-browser", "Extrair matriz de estado (Cookies) do navegador (ex: chrome, firefox)", requires_input=True, category="Evasão de Restrições"),
+            EngineFlag("--cookies-from-browser", "Extrair matriz de estado (Cookies) do navegador", requires_input=True, category="Evasão de Restrições"),
             EngineFlag("--user-agent", "Falsificação estrita da string de User-Agent", requires_input=True, category="Evasão de Restrições"),
-            
             EngineFlag("--sleep-requests", "Atraso determinístico entre requisições iterativas (segundos)", requires_input=True, category="Regulação de Fluxo"),
-            EngineFlag("--sleep-interval", "Atraso limite inferior (randômico) entre transações (segundos)", requires_input=True, category="Regulação de Fluxo"),
-            EngineFlag("--max-sleep-interval", "Atraso limite superior (randômico) entre transações (segundos)", requires_input=True, category="Regulação de Fluxo"),
-            
+            EngineFlag("--sleep-interval", "Atraso limite inferior (randômico) entre transações", requires_input=True, category="Regulação de Fluxo"),
+            EngineFlag("--max-sleep-interval", "Atraso limite superior (randômico) entre transações", requires_input=True, category="Regulação de Fluxo"),
             EngineFlag("--ignore-errors", "Ignorar exceções isoladas e manter topologia contínua", category="Sistema de Arquivos"),
             EngineFlag("--no-warnings", "Suprimir pipeline de avisos no STDERR", category="Sistema de Arquivos"),
-            EngineFlag("--restrict-filenames", "Normalizar nomenclatura para o padrão ASCII (suprime espaços e caracteres especiais)", category="Sistema de Arquivos"),
+            EngineFlag("--restrict-filenames", "Normalizar nomenclatura para o padrão ASCII", category="Sistema de Arquivos"),
             EngineFlag("--windows-filenames", "Garantir conversão de nomenclatura para conformidade POSIX/Win32", category="Sistema de Arquivos"),
-            EngineFlag("--no-overwrites", "Bloquear sobrescrita (Skip) em partições alocadas previamente", category="Sistema de Arquivos"),
-            EngineFlag("--continue", "Forçar a retoma explícita de blocos binários não consolidados", category="Sistema de Arquivos"),
-            
-            EngineFlag("--match-filter", "Filtro booleano AST (ex: !is_live & url!*=/shorts/)", requires_input=True, category="Processamento Estrutural"),
+            EngineFlag("--no-overwrites", "Bloquear sobrescrita (Skip) em partições alocadas", category="Sistema de Arquivos"),
+            EngineFlag("--continue", "Forçar a retoma explícita de blocos binários", category="Sistema de Arquivos"),
+            EngineFlag("--match-filter", "Filtro booleano AST", requires_input=True, category="Processamento Estrutural"),
             EngineFlag("--playlist-reverse", "Inverter a fila do algoritmo de busca (LIFO)", category="Processamento Estrutural"),
-            EngineFlag("--break-on-existing", "Interromper Thread ao encontrar nó persistido (Otimiza rotinas de sincronização)", category="Processamento Estrutural"),
+            EngineFlag("--break-on-existing", "Interromper Thread ao encontrar nó persistido", category="Processamento Estrutural"),
             EngineFlag("--max-downloads", "Limite quantitativo absoluto de nós a extrair", requires_input=True, category="Processamento Estrutural"),
-            
             EngineFlag("--write-subs", "Efetuar I/O de legendas nativas", category="Metadados e Telemetria"),
             EngineFlag("--write-auto-subs", "Sintetizar matriz de legendas automáticas (ASR)", category="Metadados e Telemetria"),
             EngineFlag("--sub-langs", "Vetor ISO de segmentação de idiomas (ex: en,pt)", requires_input=True, category="Metadados e Telemetria"),
-            EngineFlag("--embed-chapters", "Injetar matriz estrutural de capítulos via multiplexador (FFmpeg)", category="Metadados e Telemetria"),
-            EngineFlag("--write-info-json", "Descarregar manifesto RAW (JSON) de telemetria da entidade", category="Metadados e Telemetria"),
-            
-            EngineFlag("--extractor-args", "Injeção nativa de dependências lógicas ao módulo base (ex: youtube:player_client=android)", requires_input=True, category="Baixo Nível")
+            EngineFlag("--embed-chapters", "Injetar matriz estrutural de capítulos via multiplexador", category="Metadados e Telemetria"),
+            EngineFlag("--write-info-json", "Descarregar manifesto RAW (JSON)", category="Metadados e Telemetria"),
+            EngineFlag("--extractor-args", "Injeção nativa de dependências lógicas ao módulo base", requires_input=True, category="Baixo Nível")
         ]
 
     def _init_ui(self) -> None:
         layout = QVBoxLayout(self)
-        
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        
         container = QWidget()
         container_layout = QVBoxLayout(container)
         
@@ -228,26 +351,27 @@ class EngineFlagsDialog(QDialog):
             for flag in flags:
                 row_layout = QHBoxLayout()
                 chk = QCheckBox(f"{flag.cli_arg} - {flag.description}", group)
-                
                 input_field = None
                 if flag.requires_input:
                     input_field = QLineEdit(group)
                     input_field.setPlaceholderText("Atribuir valor...")
                     input_field.setEnabled(False)
-                    
                     def toggle_input(state: int, field: QLineEdit = input_field) -> None:
                         field.setEnabled(state == Qt.CheckState.Checked.value)
-                        
                     chk.stateChanged.connect(toggle_input)
-                    
                 row_layout.addWidget(chk)
                 if input_field:
                     row_layout.addWidget(input_field)
-                    
                 group_layout.addLayout(row_layout)
                 self._ui_elements[flag.cli_arg] = (chk, input_field)
-                
             container_layout.addWidget(group)
+
+        unknown_group = QGroupBox("Flags Personalizadas Órfãs", container)
+        unknown_layout = QVBoxLayout(unknown_group)
+        self.in_unknown_flags = QLineEdit(unknown_group)
+        self.in_unknown_flags.setPlaceholderText("Insira parâmetros adicionais...")
+        unknown_layout.addWidget(self.in_unknown_flags)
+        container_layout.addWidget(unknown_group)
 
         container_layout.addStretch()
         scroll.setWidget(container)
@@ -256,34 +380,39 @@ class EngineFlagsDialog(QDialog):
         btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         btn_box.button(QDialogButtonBox.StandardButton.Ok).setText("Aplicar")
         btn_box.button(QDialogButtonBox.StandardButton.Cancel).setText("Cancelar")
-        
         btn_box.accepted.connect(self.accept)
         btn_box.rejected.connect(self.reject)
         layout.addWidget(btn_box)
 
     def _hydrate_state(self) -> None:
-        if not self._current_flags:
-            return
-            
+        if not self._current_flags: return
         try:
             tokens = shlex.split(self._current_flags)
         except ValueError as e:
             logging.warning(f"[Lexer] Falha ao efetuar parse da sintaxe AST: {e}")
             tokens = self._current_flags.split()
 
-        for i, token in enumerate(tokens):
+        unknown = []
+        i = 0
+        while i < len(tokens):
+            token = tokens[i]
             if token in self._ui_elements:
                 chk, input_field = self._ui_elements[token]
                 chk.setChecked(True)
-                
                 flag = next((f for f in self._flag_registry if f.cli_arg == token), None)
                 if flag and flag.requires_input and input_field:
                     if i + 1 < len(tokens) and not tokens[i+1].startswith("--"):
                         input_field.setText(tokens[i+1])
+                        i += 1
+            else:
+                unknown.append(token)
+            i += 1
+        
+        if unknown:
+            self.in_unknown_flags.setText(" ".join(unknown))
 
     def compile_flags(self) -> str:
         compiled = []
-        
         for cli_arg, (chk, input_field) in self._ui_elements.items():
             if chk.isChecked():
                 if input_field:
@@ -293,6 +422,10 @@ class EngineFlagsDialog(QDialog):
                         compiled.append(f'{cli_arg} "{val_clean}"')
                 else:
                     compiled.append(cli_arg)
+        
+        unknown = self.in_unknown_flags.text().strip()
+        if unknown:
+            compiled.append(unknown)
                     
         return " ".join(compiled)
 
@@ -306,8 +439,7 @@ class DialogThumbnailWorker(QRunnable):
         self.release_id = release_id
         self.release_group_id = release_group_id
         self.signals = DialogThumbnailSignals()
-        self.ctx = ssl.create_default_context()
-        self.headers = {"User-Agent": f"{APP_NAME}/{VERSION}", "Connection": "close"}
+        self.headers = {"User-Agent": MB_USER_AGENT, "Connection": "close"}
 
     @pyqtSlot()
     def run(self) -> None:
@@ -318,7 +450,7 @@ class DialogThumbnailWorker(QRunnable):
         for url in endpoints:
             try:
                 req = urllib.request.Request(url, headers=self.headers)
-                with urllib.request.urlopen(req, timeout=8, context=self.ctx) as response:
+                with urllib.request.urlopen(req, timeout=8, context=_SHARED_SSL_CTX) as response:
                     buffer = response.read()
                     image = QImage()
                     if image.loadFromData(buffer):
@@ -332,26 +464,24 @@ class DialogThumbnailWorker(QRunnable):
 
 class APIRateLimiter:
     def __init__(self, rate: float, capacity: int) -> None:
-        self.rate: float = rate
-        self.capacity: int = capacity
-        self.tokens: float = float(capacity)
-        self.last_update: float = time.monotonic()
-        self.condition: threading.Condition = threading.Condition()
+        self.rate = rate
+        self.capacity = capacity
+        self.tokens = float(capacity)
+        self.last_update = time.monotonic()
+        self.condition = threading.Condition()
 
     def wait(self) -> None:
         with self.condition:
-            while True:
+            def _has_token() -> bool:
                 now = time.monotonic()
                 elapsed = now - self.last_update
                 self.tokens = min(float(self.capacity), self.tokens + elapsed * self.rate)
                 self.last_update = now
+                return self.tokens >= 1.0
 
-                if self.tokens >= 1.0:
-                    self.tokens -= 1.0
-                    return
-                
-                sleep_time = (1.0 - self.tokens) / self.rate
-                self.condition.wait(timeout=sleep_time)
+            self.condition.wait_for(_has_token)
+            self.tokens -= 1.0
+            self.condition.notify_all()
 
 mb_rate_limiter = APIRateLimiter(rate=1.0, capacity=1)
 
@@ -371,7 +501,6 @@ class ThemeManager:
             palette.setColor(QPalette.ColorRole.ButtonText, Qt.GlobalColor.white)
             palette.setColor(QPalette.ColorRole.Highlight, QColor(0, 122, 204))
             palette.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.white)
-            
             palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor(120, 120, 120))
             palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, QColor(120, 120, 120))
             palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor(120, 120, 120))
@@ -387,7 +516,6 @@ class ThemeManager:
             palette.setColor(QPalette.ColorRole.ButtonText, Qt.GlobalColor.black)
             palette.setColor(QPalette.ColorRole.Highlight, QColor(0, 122, 204))
             palette.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.white)
-            
             palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor(150, 150, 150))
             palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, QColor(150, 150, 150))
             palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor(150, 150, 150))
@@ -396,36 +524,42 @@ class ThemeManager:
     @staticmethod
     def get_stylesheet(is_dark: bool) -> str:
         qss = """
-            QWidget { font-family: 'Segoe UI', 'Roboto', sans-serif; font-size: 13px; }
-            QFrame#Panel { border-radius: 8px; border: 1px solid UID_BORDER; background-color: UID_PANEL_BG; }
-            QPushButton#PrimaryAction { background-color: #007acc; color: white; border-radius: 4px; padding: 8px 16px; font-weight: bold; border: none; }
-            QPushButton#PrimaryAction:hover { background-color: #0062a3; }
-            QPushButton#PrimaryAction:disabled { background-color: UID_DISABLED_BG; color: UID_DISABLED_TXT; }
-            QPushButton#Destructive { color: #d32f2f; border: 1px solid #d32f2f; border-radius: 4px; padding: 4px 8px; background-color: transparent; }
-            QPushButton#Destructive:hover { background-color: rgba(211, 47, 47, 0.1); }
-            QLabel#MainHeader { color: #007acc; font-size: 24px; font-weight: 800; letter-spacing: 2px; }
-            QLabel#ThumbLabel { background-color: UID_THUMB_BG; border: 1px solid UID_BORDER; color: UID_THUMB_TEXT; }
-            QLabel#StatsLabel, QLabel#LogHeader { color: UID_THUMB_TEXT; }
-            QLabel#LogHeader { font-weight: bold; font-size: 10px; letter-spacing: 1px; }
-            QPlainTextEdit#LogConsole { background-color: UID_CONSOLE_BG; color: UID_CONSOLE_TEXT; font-family: 'Consolas', 'Courier New', monospace; font-size: 11px; border: 1px solid UID_BORDER; border-radius: 4px; }
-            QMenu { background-color: UID_PANEL_BG; border: 1px solid UID_BORDER; padding: 5px; }
-            QMenu::item { padding: 6px 20px 6px 20px; border-radius: 4px; }
-            QMenu::item:selected { background-color: #007acc; color: white; }
-            QMenu::separator { height: 1px; background: UID_BORDER; margin: 4px 10px; }
-            QLineEdit[readOnly="true"] { background-color: UID_DISABLED_BG; color: UID_DISABLED_TXT; border: 1px dashed UID_BORDER; }
+            QWidget {{ font-family: 'Segoe UI', 'Roboto', sans-serif; font-size: 13px; }}
+            QFrame#Panel {{ border-radius: 8px; border: 1px solid {BORDER}; background-color: {PANEL_BG}; }}
+            QPushButton#PrimaryAction {{ background-color: #007acc; color: white; border-radius: 4px; padding: 8px 16px; font-weight: bold; border: none; }}
+            QPushButton#PrimaryAction:hover {{ background-color: #0062a3; }}
+            QPushButton#PrimaryAction:disabled {{ background-color: {DISABLED_BG}; color: {DISABLED_TXT}; }}
+            QPushButton#Destructive {{ color: #d32f2f; border: 1px solid #d32f2f; border-radius: 4px; padding: 4px 8px; background-color: transparent; }}
+            QPushButton#Destructive:hover {{ background-color: rgba(211, 47, 47, 0.1); }}
+            QLabel#MainHeader {{ color: #007acc; font-size: 24px; font-weight: 800; letter-spacing: 2px; }}
+            QLabel#ThumbLabel {{ background-color: {THUMB_BG}; border: 1px solid {BORDER}; color: {THUMB_TEXT}; }}
+            QLabel#StatsLabel, QLabel#LogHeader {{ color: {THUMB_TEXT}; }}
+            QLabel#LogHeader {{ font-weight: bold; font-size: 10px; letter-spacing: 1px; }}
+            QPlainTextEdit#LogConsole {{ background-color: {CONSOLE_BG}; color: {CONSOLE_TEXT}; font-family: 'Consolas', 'Courier New', monospace; font-size: 11px; border: 1px solid {BORDER}; border-radius: 4px; }}
+            QMenu {{ background-color: {PANEL_BG}; border: 1px solid {BORDER}; padding: 5px; }}
+            QMenu::item {{ padding: 6px 20px 6px 20px; border-radius: 4px; }}
+            QMenu::item:selected {{ background-color: #007acc; color: white; }}
+            QMenu::separator {{ height: 1px; background: {BORDER}; margin: 4px 10px; }}
+            QLineEdit[readOnly="true"] {{ background-color: {DISABLED_BG}; color: {DISABLED_TXT}; border: 1px dashed {BORDER}; }}
         """
-        if is_dark:
-            return qss.replace("UID_BORDER", "#3d3d3d").replace("UID_PANEL_BG", "#1e1e1e").replace("UID_THUMB_BG", "#000000").replace("UID_THUMB_TEXT", "#aaaaaa").replace("UID_CONSOLE_BG", "#0e0e0e").replace("UID_CONSOLE_TEXT", "#d4d4d4").replace("UID_DISABLED_BG", "#2a2a2a").replace("UID_DISABLED_TXT", "#888888")
-        return qss.replace("UID_BORDER", "#cccccc").replace("UID_PANEL_BG", "#ffffff").replace("UID_THUMB_BG", "#eaeaea").replace("UID_THUMB_TEXT", "#666666").replace("UID_CONSOLE_BG", "#ffffff").replace("UID_CONSOLE_TEXT", "#333333").replace("UID_DISABLED_BG", "#f0f0f0").replace("UID_DISABLED_TXT", "#777777")
+        tokens = {
+            'BORDER': '#3d3d3d' if is_dark else '#cccccc',
+            'PANEL_BG': '#1e1e1e' if is_dark else '#ffffff',
+            'THUMB_BG': '#000000' if is_dark else '#eaeaea',
+            'THUMB_TEXT': '#aaaaaa' if is_dark else '#666666',
+            'CONSOLE_BG': '#0e0e0e' if is_dark else '#ffffff',
+            'CONSOLE_TEXT': '#d4d4d4' if is_dark else '#333333',
+            'DISABLED_BG': '#2a2a2a' if is_dark else '#f0f0f0',
+            'DISABLED_TXT': '#888888' if is_dark else '#777777',
+        }
+        return qss.format_map(tokens)
 
 class QtLogHandler(logging.Handler, QObject):
     log_record = pyqtSignal(str, int)
-
     def __init__(self) -> None:
         logging.Handler.__init__(self)
         QObject.__init__(self)
         self.setFormatter(logging.Formatter('[%(asctime)s] %(name)s: %(message)s', datefmt='%H:%M:%S'))
-
     def emit(self, record: logging.LogRecord) -> None:
         msg = self.format(record)
         self.log_record.emit(msg, record.levelno)
@@ -496,7 +630,7 @@ class LogViewerWidget(QWidget):
         self.text_edit.clear()
 
 class PlaylistTableModel(QAbstractTableModel):
-    def __init__(self, entities: List[proc.NormalizedMediaEntity], parent: Optional[QObject] = None) -> None:
+    def __init__(self, entities: List[Any], parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
         self._entities = entities
         self._checked_states = [True] * len(entities)
@@ -509,9 +643,7 @@ class PlaylistTableModel(QAbstractTableModel):
         return len(self._headers)
 
     def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
-        if not index.isValid():
-            return None
-            
+        if not index.isValid(): return None
         row, col = index.row(), index.column()
         entity = self._entities[row]
 
@@ -520,13 +652,10 @@ class PlaylistTableModel(QAbstractTableModel):
             if col == 2: return entity.artist
             if col == 3: return entity.album
             if col == 4: return entity.display_duration
-            
         elif role == Qt.ItemDataRole.CheckStateRole and col == 0:
             return Qt.CheckState.Checked.value if self._checked_states[row] else Qt.CheckState.Unchecked.value
-            
         elif role == Qt.ItemDataRole.TextAlignmentRole and col in (0, 4):
             return Qt.AlignmentFlag.AlignCenter.value
-
         return None
 
     def setData(self, index: QModelIndex, value: Any, role: int = Qt.ItemDataRole.EditRole) -> bool:
@@ -548,15 +677,17 @@ class PlaylistTableModel(QAbstractTableModel):
         return None
 
     def toggle_all(self, state: bool) -> None:
-        self.beginResetModel()
         self._checked_states = [state] * len(self._entities)
-        self.endResetModel()
+        if self._entities:
+            top_left = self.index(0, 0)
+            bottom_right = self.index(len(self._entities) - 1, 0)
+            self.dataChanged.emit(top_left, bottom_right, [Qt.ItemDataRole.CheckStateRole])
 
-    def get_selected_entities(self) -> List[proc.NormalizedMediaEntity]:
+    def get_selected_entities(self) -> List[Any]:
         return [ent for i, ent in enumerate(self._entities) if self._checked_states[i]]
     
 class PlaylistStagingDialog(QDialog):
-    def __init__(self, entities: List[proc.NormalizedMediaEntity], parent: Optional[QWidget] = None) -> None:
+    def __init__(self, entities: List[Any], parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Pré-Processamento de Topologia em Árvore (Playlist)")
         self.setMinimumSize(900, 500)
@@ -565,7 +696,6 @@ class PlaylistStagingDialog(QDialog):
 
     def _init_ui(self) -> None:
         layout = QVBoxLayout(self)
-        
         lbl_info = QLabel(f"<b>Topologia detectada:</b> Lista de Reprodução ou Álbum ({self.model.rowCount()} nós identificados).<br>Selecione as entidades a transacionar para o motor DSP.")
         layout.addWidget(lbl_info)
         
@@ -602,7 +732,7 @@ class PlaylistStagingDialog(QDialog):
         ctrl_layout.addWidget(btn_box)
         layout.addLayout(ctrl_layout)
 
-    def get_selected_entities(self) -> List[proc.NormalizedMediaEntity]:
+    def get_selected_entities(self) -> List[Any]:
         return self.model.get_selected_entities()
 
 @dataclass
@@ -624,14 +754,13 @@ class CoverArtSignals(QObject):
     error = pyqtSignal(str)
 
 class MusicBrainzWorker(QRunnable):
-    def __init__(self, title_query: str, artist_query: str, album_query: str, date_query: str, app_name: str, version: str) -> None:
+    def __init__(self, title_query: str, artist_query: str, album_query: str, date_query: str, user_agent: str) -> None:
         super().__init__()
         self.title_query = title_query
         self.artist_query = artist_query
         self.album_query = album_query
         self.date_query = date_query
-        self.app_name = app_name
-        self.version = version
+        self.user_agent = user_agent
         self.signals = MusicBrainzSignals()
 
     def _escape_lucene(self, text: str) -> str:
@@ -654,17 +783,16 @@ class MusicBrainzWorker(QRunnable):
             url = f"https://musicbrainz.org/ws/2/recording/?query={encoded_query}&fmt=json"
             
             headers = {
-                "User-Agent": f"{self.app_name}/{self.version} ( dev@localhost )",
+                "User-Agent": self.user_agent,
                 "Accept": "application/json",
                 "Connection": "keep-alive"
             }
             req = urllib.request.Request(url, headers=headers)
-            ctx = ssl.create_default_context()
             
             mb_rate_limiter.wait()
             logging.debug(f"[Network] A consultar AST Lucene MusicBrainz: {url}")
             
-            with urllib.request.urlopen(req, timeout=15, context=ctx) as response:
+            with urllib.request.urlopen(req, timeout=15, context=_SHARED_SSL_CTX) as response:
                 data = json.loads(response.read().decode('utf-8'))
                 
             candidates: List[MetadataCandidate] = []
@@ -698,38 +826,14 @@ class MusicBrainzWorker(QRunnable):
 class CoverArtWorker(QRunnable):
     def __init__(self, release_id: str, release_group_id: str) -> None:
         super().__init__()
-        self.release_id: str = release_id
-        self.release_group_id: str = release_group_id
-        self.signals: CoverArtSignals = CoverArtSignals()
-        self.ctx: ssl.SSLContext = ssl.create_default_context()
-        self.headers: Dict[str, str] = {
-            "User-Agent": f"SoundStreamPro/7.3.0 ( dev@localhost )",
+        self.release_id = release_id
+        self.release_group_id = release_group_id
+        self.signals = CoverArtSignals()
+        self.headers = {
+            "User-Agent": MB_USER_AGENT,
             "Accept": "application/json",
             "Connection": "keep-alive"
         }
-
-    def with_exponential_backoff(max_retries: int = 3, base_delay: float = 1.0) -> Callable[[Callable[..., T]], Callable[..., T]]:
-        def decorator(func: Callable[..., T]) -> Callable[..., T]:
-            @wraps(func)
-            def wrapper(*args: Any, **kwargs: Any) -> T:
-                attempt = 0
-                while attempt < max_retries:
-                    try:
-                        return func(*args, **kwargs)
-                    except (urllib.error.URLError, ssl.SSLError, ConnectionError) as e:
-                        error_msg = str(e)
-                        if "UNEXPECTED_EOF" in error_msg or "EOF occurred" in error_msg or "Connection reset" in error_msg:
-                            attempt += 1
-                            if attempt >= max_retries:
-                                raise
-                            
-                            delay = base_delay * (2 ** attempt)
-                            logging.warning(f"[Network] Interrupção prematura de TCP/TLS. Retentativa {attempt}/{max_retries} pendente (Atraso: {delay}s).")
-                            time.sleep(delay)
-                        else:
-                            raise
-            return wrapper
-        return decorator
 
     @with_exponential_backoff(max_retries=5, base_delay=1.0)
     def _fetch_json_manifest(self, endpoint_type: str, entity_id: str) -> Optional[Dict[str, Any]]:
@@ -742,7 +846,7 @@ class CoverArtWorker(QRunnable):
         logging.debug(f"[Network] A analisar manifesto do {endpoint_type}: {entity_id}")
         
         try:
-            with urllib.request.urlopen(req, timeout=15, context=self.ctx) as response:
+            with urllib.request.urlopen(req, timeout=15, context=_SHARED_SSL_CTX) as response:
                 return json.loads(response.read().decode('utf-8'))
         except urllib.error.HTTPError as e:
             if e.code in (404, 400):
@@ -755,9 +859,7 @@ class CoverArtWorker(QRunnable):
 
     def _extract_optimal_resolution(self, manifest: Dict[str, Any]) -> Optional[str]:
         images: List[Dict[str, Any]] = manifest.get("images", [])
-        if not images:
-            return None
-
+        if not images: return None
         for img in images:
             is_front = img.get("front", False) or "Front" in img.get("types", [])
             if is_front:
@@ -766,16 +868,13 @@ class CoverArtWorker(QRunnable):
                 if "500" in thumbnails: return thumbnails["500"]
                 if "250" in thumbnails: return thumbnails["250"]
                 return img.get("image")
-        
         return images[0].get("image")
 
     @pyqtSlot()
     def run(self) -> None:
         try:
             manifest = self._fetch_json_manifest("release", self.release_id)
-            
             if not manifest and self.release_group_id:
-                logging.info(f"[Parser] Executando Fallback Heurístico para Release Group: {self.release_group_id}")
                 manifest = self._fetch_json_manifest("release-group", self.release_group_id)
 
             if not manifest:
@@ -787,17 +886,14 @@ class CoverArtWorker(QRunnable):
                 self.signals.error.emit("Nenhum nó de imagem front/thumbnail classificado no manifesto.")
                 return
 
-            logging.info(f"[Process] Fluxo binário selecionado: {optimal_url}")
             req = urllib.request.Request(optimal_url, headers={"User-Agent": self.headers["User-Agent"]})
-            
-            with urllib.request.urlopen(req, timeout=30, context=self.ctx) as response:
+            with urllib.request.urlopen(req, timeout=30, context=_SHARED_SSL_CTX) as response:
                 buffer = response.read()
 
             image = QImage()
             if image.loadFromData(buffer):
                 self.signals.result_ready.emit(image)
             else:
-                logging.error("[Parser] O buffer de memória contém um cabeçalho de imagem inválido ou corrompido.")
                 self.signals.error.emit("Falha no decodificador de matriz de bits da imagem.")
 
         except Exception as e:
@@ -863,11 +959,8 @@ class MetadataSelectionDialog(QDialog):
         if sip.isdeleted(self) or sip.isdeleted(self.table): return
         
         pixmap = QPixmap.fromImage(image).scaled(
-            50, 50, 
-            Qt.AspectRatioMode.KeepAspectRatio, 
-            Qt.TransformationMode.SmoothTransformation
+            50, 50, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
         )
-        
         lbl_cover = QLabel(self.table)
         lbl_cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl_cover.setPixmap(pixmap)
@@ -884,9 +977,13 @@ class InspectorPanel(QFrame):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setObjectName("Panel")
-        self._current_meta: Optional[proc.NormalizedMediaEntity] = None
+        self._current_meta: Optional[EntityStub] = None
         self._current_source_url: str = ""
         self._local_custom_cover_path: str = ""
+        self._filename_debounce = QTimer(self)
+        self._filename_debounce.setSingleShot(True)
+        self._filename_debounce.setInterval(150)
+        self._filename_debounce.timeout.connect(self._compute_dynamic_filename)
         self._init_ui()
 
     def _init_ui(self) -> None:
@@ -942,7 +1039,7 @@ class InspectorPanel(QFrame):
         fmt_grid = QGridLayout()
         
         self.cb_container = QComboBox(tab_format)
-        self.cb_container.currentTextChanged.connect(self._on_container_changed)
+        self.cb_container.currentTextChanged.connect(self._trigger_filename_update)
         
         self.cb_abitrate = QComboBox(tab_format)
         for k in ["320", "256", "192", "128", "96"]:
@@ -964,6 +1061,7 @@ class InspectorPanel(QFrame):
             "Melhor Disponível", "8K (4320p)", "4K (2160p)", "1440p (2K)", 
             "1080p60", "1080p", "720p60", "720p", "480p", "360p"
         ])
+        self.cb_quality.currentTextChanged.connect(self._recalc_estimate)
         
         self.cb_vcodec = QComboBox(tab_format)
         self.cb_vcodec.addItems(["Melhor", "H264", "VP9", "AV1", "DivX", "XviD"])
@@ -1010,7 +1108,6 @@ class InspectorPanel(QFrame):
         
         self.in_filename = QLineEdit(meta_content)
         self.in_filename.setReadOnly(True)
-        self.in_filename.setToolTip("Gerado ativamente (Tempo-Real) com base no Template de Saída.")
         
         self.in_title = QLineEdit(meta_content)
         self.in_artist = QLineEdit(meta_content)
@@ -1047,7 +1144,6 @@ class InspectorPanel(QFrame):
         cookie_layout.setContentsMargins(0, 0, 0, 0)
         self.chk_cookies = QCheckBox("Utilizar Cookies do Navegador", chk_group)
         self.btn_import_cookies = QPushButton("Importar", chk_group)
-        self.btn_import_cookies.setToolTip("Injetar estado de sessão (cookies.txt) no diretório de execução.")
         self.btn_import_cookies.clicked.connect(self._import_cookies)
         
         cookie_layout.addWidget(self.chk_cookies)
@@ -1086,12 +1182,7 @@ class InspectorPanel(QFrame):
         ffmpeg_layout.addWidget(self.in_ffmpeg_path)
         ffmpeg_layout.addWidget(btn_browse_ffmpeg)
         
-        default_flags = (
-            '--extractor-args "youtube:player_client=android,tv" '
-            '--match-filter "!is_live & url!*=/shorts/ & title!~=\'(?i)(official video|music video|videoclipe|clip|visualizer|live|cover|karaoke|instrumental|acústico|acoustic)\'" '
-            '--force-ipv4'
-        )
-        self.in_custom_flags = QLineEdit(default_flags, dev_group)
+        self.in_custom_flags = QLineEdit(dev_group)
         self.in_custom_flags.setReadOnly(True)
         
         self.btn_open_flags = QPushButton("Personalizar Flags", dev_group)
@@ -1122,24 +1213,23 @@ class InspectorPanel(QFrame):
         
         self._update_ui_mode()
         
-        self.in_title.textChanged.connect(self._update_dynamic_filename)
-        self.in_artist.textChanged.connect(self._update_dynamic_filename)
-        self.in_album.textChanged.connect(self._update_dynamic_filename)
-        self.in_genre.textChanged.connect(self._update_dynamic_filename)
-        self.in_date.textChanged.connect(self._update_dynamic_filename)
-        self.in_output_tmpl.textChanged.connect(self._update_dynamic_filename)
-        self.cb_container.currentTextChanged.connect(self._update_dynamic_filename)
+        self.in_title.textChanged.connect(self._trigger_filename_update)
+        self.in_artist.textChanged.connect(self._trigger_filename_update)
+        self.in_album.textChanged.connect(self._trigger_filename_update)
+        self.in_genre.textChanged.connect(self._trigger_filename_update)
+        self.in_date.textChanged.connect(self._trigger_filename_update)
+        self.in_output_tmpl.textChanged.connect(self._trigger_filename_update)
+
+    @pyqtSlot()
+    def _trigger_filename_update(self, *args: Any) -> None:
+        self._filename_debounce.start()
 
     @pyqtSlot()
     def _open_flags_editor(self) -> None:
         if sip.isdeleted(self.in_custom_flags): return
-        
-        current_state = self.in_custom_flags.text().strip()
-        dialog = EngineFlagsDialog(current_state, self)
-        
+        dialog = EngineFlagsDialog(self.in_custom_flags.text().strip(), self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            new_flags = dialog.compile_flags()
-            self.in_custom_flags.setText(new_flags)
+            self.in_custom_flags.setText(dialog.compile_flags())
 
     def load_from_config(self, config: Any, state: Any = None) -> None:
         if getattr(config, 'media_type', None) == proc.MediaType.VIDEO:
@@ -1154,13 +1244,10 @@ class InspectorPanel(QFrame):
             idx = self.cb_container.findText(container, Qt.MatchFlag.MatchExactly)
             if idx >= 0: self.cb_container.setCurrentIndex(idx)
 
-        if hasattr(config, 'video_codec'):
-            idx = self.cb_vcodec.findText(config.video_codec, Qt.MatchFlag.MatchContains | Qt.MatchFlag.MatchCaseSensitive)
-            if idx >= 0: self.cb_vcodec.setCurrentIndex(idx)
-
-        if hasattr(config, 'audio_codec'):
-            idx = self.cb_acodec.findText(config.audio_codec, Qt.MatchFlag.MatchContains | Qt.MatchFlag.MatchCaseSensitive)
-            if idx >= 0: self.cb_acodec.setCurrentIndex(idx)
+        for attr, cb in [('video_codec', self.cb_vcodec), ('audio_codec', self.cb_acodec)]:
+            if hasattr(config, attr):
+                idx = cb.findText(getattr(config, attr), Qt.MatchFlag.MatchContains | Qt.MatchFlag.MatchCaseSensitive)
+                if idx >= 0: cb.setCurrentIndex(idx)
 
         if hasattr(config, 'quality_preset'):
             idx = self.cb_quality.findText(config.quality_preset, Qt.MatchFlag.MatchExactly)
@@ -1190,39 +1277,22 @@ class InspectorPanel(QFrame):
 
         if hasattr(config, 'output_template') and config.output_template:
             tmpl = config.output_template
-            if not tmpl.endswith(".%(ext)s"):
-                tmpl += ".%(ext)s"
+            if not tmpl.endswith(".%(ext)s"): tmpl += ".%(ext)s"
             self.in_output_tmpl.setText(tmpl)
 
-        if hasattr(config, 'ffmpeg_path'):
-            self.in_ffmpeg_path.setText(config.ffmpeg_path)
+        if hasattr(config, 'ffmpeg_path'): self.in_ffmpeg_path.setText(config.ffmpeg_path)
+        if hasattr(config, 'custom_flags'): self.in_custom_flags.setText(config.custom_flags)
 
-        if hasattr(config, 'custom_flags'):
-            if hasattr(self, 'in_custom_flags') and not sip.isdeleted(self.in_custom_flags):
-                self.in_custom_flags.setText(config.custom_flags)
-
-        class MockEntity:
-            def __init__(self, cfg):
-                self.is_playlist = False
-                self.children = []
-                self.original_id = getattr(cfg, 'url', '')
-                self.duration = 0.0
-                self.filesize = 0
-                self.is_search_query = False
-                self.width = None
-                self.height = None
-                self.fps = None
-                self.channel = getattr(cfg, 'meta_artist', 'Desconhecido')
-                
-                self.title = getattr(cfg, 'meta_title', '')
-                self.artist = getattr(cfg, 'meta_artist', '')
-                self.album = getattr(cfg, 'meta_album', '')
-                self.genre = getattr(cfg, 'meta_genre', '')
-                self.upload_date = getattr(cfg, 'meta_date', '')
-                self.description = getattr(cfg, 'meta_desc', '')
-                self.thumbnail_url = getattr(cfg, 'spotify_thumb_url', None)
-
-        self._current_meta = MockEntity(config)
+        self._current_meta = EntityStub(
+            original_id=getattr(config, 'url', ''),
+            title=getattr(config, 'meta_title', ''),
+            artist=getattr(config, 'meta_artist', ''),
+            album=getattr(config, 'meta_album', ''),
+            genre=getattr(config, 'meta_genre', ''),
+            upload_date=getattr(config, 'meta_date', ''),
+            description=getattr(config, 'meta_desc', ''),
+            thumbnail_url=getattr(config, 'spotify_thumb_url', None)
+        )
         self._current_source_url = getattr(config, 'url', '')
 
         cover_path = getattr(state, 'custom_cover_path', None) if state else getattr(config, 'custom_cover_path', None)
@@ -1232,161 +1302,114 @@ class InspectorPanel(QFrame):
                 self._local_custom_cover_path = str(path)
                 self.set_thumbnail(QPixmap(str(path)))
 
-        self._update_dynamic_filename()
+        self._compute_dynamic_filename()
 
     @pyqtSlot()
-    def _update_dynamic_filename(self) -> None:
-        if sip.isdeleted(self) or sip.isdeleted(self.in_output_tmpl) or sip.isdeleted(self.in_filename): 
-            return
+    def _compute_dynamic_filename(self) -> None:
+        if sip.isdeleted(self) or sip.isdeleted(self.in_output_tmpl) or sip.isdeleted(self.in_filename): return
             
         tmpl = self.in_output_tmpl.text().strip()
         if not tmpl:
             self.in_filename.setText("")
             self.in_output_tmpl.setStyleSheet("border: 1px solid #d32f2f;")
-            self.in_output_tmpl.setToolTip("Erro de Consistência: O Template não pode ser nulo.")
             return
             
         self.in_output_tmpl.setStyleSheet("")
-        
         is_batch = not self.tabs.isTabEnabled(1)
         
-        title = self.in_title.text().strip() or ("Título" if not is_batch else "Variáveis em Lote")
-        artist = self.in_artist.text().strip() or ("Artista" if not is_batch else "Vários Artistas")
-        album = self.in_album.text().strip() or ("Álbum" if not is_batch else "Vários Álbuns")
-        genre = self.in_genre.text().strip() or "Género"
-        date_full = self.in_date.text().strip()
-        year = date_full[:4] if date_full else "Ano"
-        ext = self.cb_container.currentText() if not sip.isdeleted(self.cb_container) else "ext"
-        
         mapping = {
-            'title': title,
-            'artist': artist,
-            'uploader': artist,
-            'album': album,
-            'genre': genre,
-            'release_year': year,
-            'upload_date': date_full or "Data",
-            'ext': ext,
+            'title': self.in_title.text().strip() or ("Título" if not is_batch else "Variáveis em Lote"),
+            'artist': self.in_artist.text().strip() or ("Artista" if not is_batch else "Vários Artistas"),
+            'uploader': self.in_artist.text().strip() or ("Artista" if not is_batch else "Vários Artistas"),
+            'album': self.in_album.text().strip() or ("Álbum" if not is_batch else "Vários Álbuns"),
+            'genre': self.in_genre.text().strip() or "Género",
+            'release_year': self.in_date.text().strip()[:4] if self.in_date.text().strip() else "Ano",
+            'upload_date': self.in_date.text().strip() or "Data",
+            'ext': self.cb_container.currentText() if not sip.isdeleted(self.cb_container) else "ext",
             'playlist': "Playlist",
             'playlist_index': "01"
         }
         
         def safe_sub(match: re.Match) -> str:
-            key = match.group(1)
-            val = mapping.get(key, f"%({key})s")
+            val = mapping.get(match.group(1), f"%({match.group(1)})s")
             return re.sub(r'[<>:"/\\|?*]', '', str(val))
             
         try:
             res = re.sub(r'%\(([^)]+)\)s', safe_sub, tmpl)
             res = re.sub(r'\s+', ' ', res).strip(' -_')
             self.in_filename.setText(res)
-            
             if "%(" in res:
                 self.in_output_tmpl.setStyleSheet("border: 1px solid #ff9800;")
-                self.in_output_tmpl.setToolTip("Aviso Léxico: Foram detetadas variáveis órfãs/não preenchidas.")
             else:
-                self.in_output_tmpl.setToolTip("Sintaxe AST Válida")
-                
+                self.in_output_tmpl.setStyleSheet("")
         except Exception as e:
-            self.in_filename.setText("Falha na Resolução Lexical")
+            self.in_filename.setText("Falha Lexical")
             self.in_output_tmpl.setStyleSheet("border: 1px solid #d32f2f;")
-            self.in_output_tmpl.setToolTip(f"Erro: {str(e)}")
 
     def _browse_custom_cover(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Selecionar Capa Personalizada", "", "Imagens (*.jpg *.jpeg *.png)")
+        path, _ = QFileDialog.getOpenFileName(self, "Selecionar Capa", "", "Imagens (*.jpg *.jpeg *.png)")
         if path:
             self._local_custom_cover_path = path
-            pixmap = QPixmap(path)
-            self.set_thumbnail(pixmap)
+            self.set_thumbnail(QPixmap(path))
 
     def _import_cookies(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Selecionar Matriz de Cookies", "", "Ficheiros de Texto (*.txt);;Todos os Ficheiros (*)")
-        if not path:
-            return
+        if not path: return
+        self.btn_import_cookies.setEnabled(False)
+        self.btn_import_cookies.setText("A Bloquear...")
+        
+        worker = CookieImportWorker(path)
+        worker.signals.success.connect(self._on_cookies_imported)
+        worker.signals.error.connect(self._on_cookies_error)
+        QThreadPool.globalInstance().start(worker)
 
-        try:
-            source_path = Path(path)
-            with open(source_path, "r", encoding="utf-8", errors="ignore") as f:
-                header = f.read(120)
-                if "# Netscape HTTP Cookie File" not in header:
-                    QMessageBox.warning(self, "Anomalia Heurística", "A assinatura léxica do ficheiro não corresponde à RFC 'Netscape HTTP Cookie File'. A importação foi abortada para garantir a segurança da Thread de Extração.")
-                    return
-
-            target_path = Path.cwd() / "cookies.txt"
-            
-            success = False
-            for attempt in range(5):
-                try:
-                    temp_path = target_path.with_suffix(f".tmp{attempt}")
-                    shutil.copy2(source_path, temp_path)
-                    os.replace(temp_path, target_path)
-                    success = True
-                    break
-                except PermissionError:
-                    if temp_path.exists():
-                        temp_path.unlink(missing_ok=True)
-                    time.sleep(0.5 * (1.5 ** attempt))
-                except Exception as e:
-                    if temp_path.exists():
-                        temp_path.unlink(missing_ok=True)
-                    raise e
-
-            if not success:
-                QMessageBox.warning(
-                    self, 
-                    "Violação de Mutex (WinError 32)", 
-                    "O descritor do ficheiro 'cookies.txt' encontra-se bloqueado pelo motor de análise em background.\n\n"
-                    "Aguarde a libertação do socket ou cancele as transferências ativas antes de injetar uma nova sessão."
-                )
-                return
-
-            self.chk_cookies.setChecked(True)
-            QMessageBox.information(self, "Estado Injetado", f"O descritor de estado foi transacionado de forma atómica para o workspace de execução:\n{target_path.absolute()}")
-        except Exception as e:
-            QMessageBox.critical(self, "Falha de I/O", f"Exceção não tratada ao copiar a matriz binária:\n{e}")
+    @pyqtSlot(str)
+    def _on_cookies_imported(self, path: str) -> None:
+        self.btn_import_cookies.setEnabled(True)
+        self.btn_import_cookies.setText("Importar")
+        self.chk_cookies.setChecked(True)
+        QMessageBox.information(self, "Estado Injetado", f"O descritor de estado foi transacionado de forma atómica para o workspace:\n{path}")
+        
+    @pyqtSlot(str)
+    def _on_cookies_error(self, err: str) -> None:
+        self.btn_import_cookies.setEnabled(True)
+        self.btn_import_cookies.setText("Importar")
+        QMessageBox.critical(self, "I/O Error", err)
 
     def _trigger_musicbrainz_fetch(self) -> None:
-        title = self.in_title.text().strip()
-        artist = self.in_artist.text().strip()
-        album = self.in_album.text().strip()
-        date = self.in_date.text().strip()
-        
+        title, artist, album = self.in_title.text().strip(), self.in_artist.text().strip(), self.in_album.text().strip()
         if not title and not artist and not album:
-            QMessageBox.information(self, "Aviso", "Preencha ao menos o 'Título', 'Artista' ou 'Álbum' como base de pesquisa.")
+            QMessageBox.information(self, "Aviso", "Preencha ao menos o 'Título', 'Artista' ou 'Álbum'.")
             return
 
         self.btn_fetch_mb.setEnabled(False)
         self.btn_fetch_mb.setText("A procurar...")
-        
-        worker = MusicBrainzWorker(title, artist, album, date, APP_NAME, VERSION)
+        worker = MusicBrainzWorker(title, artist, album, self.in_date.text().strip(), MB_USER_AGENT)
         worker.signals.results_ready.connect(self._on_musicbrainz_results)
         worker.signals.error.connect(self._on_musicbrainz_error)
-        
         QThreadPool.globalInstance().start(worker)
 
     @pyqtSlot(list)
     def _on_musicbrainz_results(self, candidates: List[MetadataCandidate]) -> None:
-        if sip.isdeleted(self) or sip.isdeleted(self.btn_fetch_mb): return
+        if sip.isdeleted(self): return
         self.btn_fetch_mb.setEnabled(True)
         self.btn_fetch_mb.setText("Preenchimento Automático (MusicBrainz)")
-        
         if not candidates:
-            QMessageBox.information(self, "MusicBrainz", "Nenhum resultado encontrado.")
+            QMessageBox.information(self, "MusicBrainz", "Nenhum resultado.")
             return
             
         dialog = MetadataSelectionDialog(candidates, self)
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selected_candidate:
             cand = dialog.selected_candidate
-            if cand.title and not sip.isdeleted(self.in_title): self.in_title.setText(cand.title)
-            if cand.artist and not sip.isdeleted(self.in_artist): self.in_artist.setText(cand.artist)
-            if cand.album and not sip.isdeleted(self.in_album): self.in_album.setText(cand.album)
-            if cand.date and not sip.isdeleted(self.in_date): self.in_date.setText(cand.date)
-            if cand.genre and not sip.isdeleted(self.in_genre): self.in_genre.setText(cand.genre)
+            if cand.title: self.in_title.setText(cand.title)
+            if cand.artist: self.in_artist.setText(cand.artist)
+            if cand.album: self.in_album.setText(cand.album)
+            if cand.date: self.in_date.setText(cand.date)
+            if cand.genre: self.in_genre.setText(cand.genre)
             
             if cand.release_id:
                 self.btn_fetch_mb.setText("A transferir arte HD...")
                 self.btn_fetch_mb.setEnabled(False)
-                
                 ca_worker = CoverArtWorker(cand.release_id, cand.release_group_id)
                 ca_worker.signals.result_ready.connect(self._on_cover_art_ready)
                 ca_worker.signals.error.connect(self._on_cover_art_error)
@@ -1394,316 +1417,149 @@ class InspectorPanel(QFrame):
 
     @pyqtSlot(QImage)
     def _on_cover_art_ready(self, image: QImage) -> None:
-        if sip.isdeleted(self) or sip.isdeleted(self.btn_fetch_mb): return
+        if sip.isdeleted(self): return
         self.btn_fetch_mb.setEnabled(True)
         self.btn_fetch_mb.setText("Preenchimento Automático (MusicBrainz)")
         
-        pixmap = QPixmap.fromImage(image)
-        self.set_thumbnail(pixmap)
-        
-        import tempfile
-        cache_dir = Path(tempfile.gettempdir())
-        self._local_custom_cover_path = str(cache_dir / f"cover_sndstream_custom_{uuid.uuid4().hex[:8]}.jpg")
-
-        safe_image = image.convertToFormat(QImage.Format.Format_RGB32)
-        safe_image.save(self._local_custom_cover_path, "JPG", 95)
-        
-        logging.info(f"[I/O] Arte primária fixada e convertida (RGB32). Sobrescrita bloqueada: {self._local_custom_cover_path}")
+        self.set_thumbnail(QPixmap.fromImage(image))
+        self._local_custom_cover_path = str(Path(tempfile.gettempdir()) / f"cover_custom_{uuid.uuid4().hex[:8]}.jpg")
+        image.convertToFormat(QImage.Format.Format_RGB32).save(self._local_custom_cover_path, "JPG", 95)
 
     @pyqtSlot(str)
     def _on_cover_art_error(self, err_msg: str) -> None:
-        if sip.isdeleted(self) or sip.isdeleted(self.btn_fetch_mb): return
+        if sip.isdeleted(self): return
         self.btn_fetch_mb.setEnabled(True)
         self.btn_fetch_mb.setText("Preenchimento Automático (MusicBrainz)")
-        logging.warning(f"Resolução da Arte ignorada (Original preservada): {err_msg}")
+        logging.warning(f"Arte ignorada: {err_msg}")
 
     @pyqtSlot(str)
     def _on_musicbrainz_error(self, err_msg: str) -> None:
-        if sip.isdeleted(self) or sip.isdeleted(self.btn_fetch_mb): return
+        if sip.isdeleted(self): return
         self.btn_fetch_mb.setEnabled(True)
         self.btn_fetch_mb.setText("Preenchimento Automático (MusicBrainz)")
         QMessageBox.warning(self, "Erro MusicBrainz", f"Falha na API:\n{err_msg}")
 
     def _show_template_tutorial(self) -> None:
-        tutorial_html = (
-            "<h3>Guia de Nomenclatura Dinâmica (Output Template)</h3>"
-            "<p>O template de saída orquestra a montagem estruturada dos diretórios e ficheiros.</p>"
-            "<br>"
-            "<b>Variáveis de Contexto Disponíveis:</b>"
-            "<ul>"
-            "<li><code>%(title)s</code>: Título literal da faixa</li>"
-            "<li><code>%(artist)s</code>: Nome do Artista</li>"
-            "<li><code>%(album)s</code>: Nome do Álbum</li>"
-            "<li><code>%(genre)s</code>: Género Musical</li>"
-            "<li><code>%(release_year)s</code>: Ano de Lançamento (YYYY)</li>"
-            "<li><code>%(ext)s</code>: Extensão do ficheiro (ex: mp3, flac)</li>"
-            "<li><code>%(uploader)s</code>: Entidade ou canal remetente</li>"
-            "<li><code>%(upload_date)s</code>: Data de transmissão original (YYYYMMDD)</li>"
-            "<li><code>%(playlist)s</code>: Nome da Playlist/Álbum de origem</li>"
-            "<li><code>%(playlist_index)s</code>: Índice sequencial (Track Number)</li>"
-            "</ul>"
-        )
-        msg_box = QMessageBox(self)
-        msg_box.setWindowTitle("Tutorial: yt-dlp Output Templates")
-        msg_box.setText(tutorial_html)
-        msg_box.exec()
+        QMessageBox.information(self, "Tutorial: Templates", "Variáveis Disponíveis:\n%(title)s\n%(artist)s\n%(album)s\n%(ext)s\n%(playlist_index)s\n%(release_year)s")
 
     def _browse_ffmpeg(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Selecionar Executável FFmpeg", "", "Executáveis (*.exe);;Todos os Ficheiros (*)")
-        if path:
-            self.in_ffmpeg_path.setText(path)
+        path, _ = QFileDialog.getOpenFileName(self, "Selecionar FFmpeg", "", "Executáveis (*.exe);;Todos os Ficheiros (*)")
+        if path: self.in_ffmpeg_path.setText(path)
 
-    def set_metadata(self, meta: proc.NormalizedMediaEntity) -> None:
-        if sip.isdeleted(self) or sip.isdeleted(self.in_filename): return
+    def set_metadata(self, meta: Any) -> None:
+        if sip.isdeleted(self): return
         self._current_meta = meta
         
-        if not sip.isdeleted(self.in_title): self.in_title.setText(meta.title)
-        if not sip.isdeleted(self.in_artist): self.in_artist.setText(meta.artist)
-        if not sip.isdeleted(self.in_album): self.in_album.setText(meta.album)
+        self.in_title.setText(getattr(meta, 'title', ''))
+        self.in_artist.setText(getattr(meta, 'artist', ''))
+        self.in_album.setText(getattr(meta, 'album', ''))
+        self.in_date.setText(getattr(meta, 'upload_date', '')[:4])
+        self.in_desc.setPlainText(getattr(meta, 'description', ''))
+        self.in_genre.clear()
         
-        if not sip.isdeleted(self.in_date): 
-            self.in_date.setText(meta.upload_date[:4] if meta.upload_date else "")
-        if not sip.isdeleted(self.in_desc): 
-            self.in_desc.setPlainText(meta.description if meta.description else "")
-            
-        if not sip.isdeleted(self.in_genre): self.in_genre.clear()
+        is_batch = len(getattr(meta, 'children', [])) > 1
+        self.tabs.setTabEnabled(1, not is_batch)
+        if is_batch:
+            self.in_title.clear(); self.in_artist.clear(); self.in_album.clear()
         
-        entities = getattr(meta, 'children', []) if getattr(meta, 'is_playlist', False) else []
-        is_batch_operation = len(entities) > 1
-        
-        self.tabs.setTabEnabled(1, not is_batch_operation)
-        if is_batch_operation:
-            self.tabs.setTabToolTip(1, "Metadados globais bloqueados para transações em lote (Playlists).")
-            self.in_title.clear()
-            self.in_artist.clear()
-            self.in_album.clear()
-        else:
-            self.tabs.setTabToolTip(1, "")
-        
-        is_audio_restricted = False
         orig_id = getattr(meta, 'original_id', '')
-        if isinstance(orig_id, str) and ('ytmsearch' in orig_id or 'ytsearch' in orig_id or 'music.youtube' in orig_id or 'soundcloud' in orig_id):
-            is_audio_restricted = True
-            
-        if getattr(meta, 'children', None):
-            for c in meta.children:
-                c_id = getattr(c, 'original_id', '')
-                if isinstance(c_id, str) and ('ytmsearch' in c_id or 'ytsearch' in c_id or 'music.youtube' in c_id or 'soundcloud' in c_id):
-                    is_audio_restricted = True
-                    break
-
-        if is_audio_restricted:
+        if getattr(meta, 'is_search_query', False) or any(x in str(orig_id) for x in ['ytmsearch', 'ytsearch', 'music.youtube', 'soundcloud']):
             self.rb_audio.setChecked(True)
             self.rb_video.setEnabled(False)
-            self.rb_video.setToolTip("Vídeo bloqueado: A topologia de origem restringe a extração ao formato de áudio.")
         else:
             self.rb_video.setEnabled(True)
-            self.rb_video.setToolTip("")
 
-        is_playlist_mode = getattr(meta, 'is_playlist', False)
-        self.btn_custom_cover.setEnabled(not is_playlist_mode)
-        if is_playlist_mode:
-            self.btn_custom_cover.setToolTip("A injeção de matrizes gráficas unificadas é inválida para estruturas em árvore (Playlists).")
-        else:
-            self.btn_custom_cover.setToolTip("")
-            
+        self.btn_custom_cover.setEnabled(not getattr(meta, 'is_playlist', False))
         self._recalc_estimate()
-        self._update_dynamic_filename()
+        self._compute_dynamic_filename()
 
     def set_thumbnail(self, pixmap: QPixmap) -> None:
-        if sip.isdeleted(self) or sip.isdeleted(self.thumb_lbl): return
-        self.thumb_lbl.setPixmap(pixmap)
+        if not sip.isdeleted(self.thumb_lbl): self.thumb_lbl.setPixmap(pixmap)
 
     def clear_thumbnail(self) -> None:
-        if sip.isdeleted(self) or sip.isdeleted(self.thumb_lbl): return
-        self.thumb_lbl.clear()
-        self.thumb_lbl.setText("Sem Pré-visualização")
+        if not sip.isdeleted(self.thumb_lbl):
+            self.thumb_lbl.clear()
+            self.thumb_lbl.setText("Sem Pré-visualização")
         self._local_custom_cover_path = ""
 
     def _update_ui_mode(self) -> None:
         is_video = self.rb_video.isChecked()
-        
         self.cb_container.blockSignals(True)
         self.cb_container.clear()
-        if is_video:
-            self.cb_container.addItems(["mp4", "mkv", "webm", "avi"])
-        else:
-            self.cb_container.addItems(["flac", "mp3", "wav", "m4a", "opus"])
+        self.cb_container.addItems(["mp4", "mkv", "webm", "avi"] if is_video else ["flac", "mp3", "wav", "m4a", "opus"])
         self.cb_container.blockSignals(False)
         self.cb_container.setCurrentIndex(0)
         
-        video_widgets = [self.lbl_quality, self.cb_quality, self.lbl_vcodec, self.cb_vcodec, self.lbl_acodec, self.cb_acodec]
-        for w in video_widgets:
-            w.setVisible(is_video)
-            
-        audio_widgets = [self.lbl_abitrate, self.cb_abitrate, self.lbl_asr, self.cb_asr]
-        for w in audio_widgets:
-            w.setVisible(not is_video)
-            
+        for w in [self.lbl_quality, self.cb_quality, self.lbl_vcodec, self.cb_vcodec, self.lbl_acodec, self.cb_acodec]: w.setVisible(is_video)
+        for w in [self.lbl_abitrate, self.cb_abitrate, self.lbl_asr, self.cb_asr]: w.setVisible(not is_video)
         self.chk_norm.setVisible(not is_video)
         self._on_container_changed(self.cb_container.currentText())
 
     def _on_container_changed(self, fmt: str) -> None:
         is_lossless = fmt in ['flac', 'wav']
-        
         self.cb_abitrate.setEnabled(not is_lossless)
         self.lbl_bitdepth.setVisible(is_lossless)
         self.cb_bitdepth.setVisible(is_lossless)
-        
-        if is_lossless:
-            self.lbl_abitrate.setText("Bitrate (Lossless):")
-        else:
-            self.lbl_abitrate.setText("Bitrate:")
-            
+        self.lbl_abitrate.setText("Bitrate (Lossless):" if is_lossless else "Bitrate:")
         self._recalc_estimate()
-        self._update_dynamic_filename()
+        self._compute_dynamic_filename()
 
     def _recalc_estimate(self) -> None:
-        if sip.isdeleted(self) or sip.isdeleted(self.stats_lbl) or not self._current_meta: return
-        
+        if sip.isdeleted(self) or not self._current_meta: return
         meta = self._current_meta
-        is_playlist = getattr(meta, 'is_playlist', False)
         children = getattr(meta, 'children', []) or []
-        
-        orig_id = getattr(meta, 'original_id', '')
-        source_url = getattr(self, '_current_source_url', '').lower()
-        
-        is_spotify_ytm = getattr(meta, 'is_search_query', False) or "spotify" in orig_id or "music.youtube" in orig_id or "spotify" in source_url or "music.youtube" in source_url
-        is_soundcloud = "soundcloud.com" in orig_id or "soundcloud" in source_url
-        is_video_type = self.rb_video.isChecked()
+        is_playlist = getattr(meta, 'is_playlist', False)
 
-        total_duration = 0.0
-        total_filesize = 0
-
-        if is_playlist:
-            total_duration = sum(float(getattr(c, 'duration', 0) or 0) for c in children)
-            total_filesize = sum(int(getattr(c, 'filesize', 0) or 0) for c in children)
-        else:
-            total_duration = float(getattr(meta, 'duration', 0) or 0)
-            total_filesize = int(getattr(meta, 'filesize', 0) or 0)
+        total_duration = sum(float(getattr(c, 'duration', 0) or 0) for c in children) if is_playlist else float(getattr(meta, 'duration', 0) or 0)
+        total_filesize = sum(int(getattr(c, 'filesize', 0) or 0) for c in children) if is_playlist else int(getattr(meta, 'filesize', 0) or 0)
 
         if total_filesize <= 0 and total_duration > 0:
-            bitrate_kbps = 128
-            if is_video_type:
-                q_text = self.cb_quality.currentText().lower()
-                if "4k" in q_text or "2160" in q_text: bitrate_kbps = 15000
-                elif "1440" in q_text: bitrate_kbps = 8000
-                elif "1080" in q_text: bitrate_kbps = 5000
-                elif "720" in q_text: bitrate_kbps = 2500
-                elif "480" in q_text: bitrate_kbps = 1000
-                else: bitrate_kbps = 5000 
+            if self.rb_video.isChecked():
+                q = self.cb_quality.currentText().lower()
+                bitrate_kbps = 15000 if '4k' in q or '2160' in q else 8000 if '1440' in q else 5000 if '1080' in q else 2500 if '720' in q else 1000 if '480' in q else 500
             else:
-                fmt = self.cb_container.currentText().lower()
-                if fmt in ['flac', 'wav']:
-                    bitrate_kbps = 900 if fmt == 'flac' else 1411
-                else:
-                    try:
-                        bitrate_kbps = int(self.cb_abitrate.currentData() or 192)
-                    except ValueError:
-                        bitrate_kbps = 192
-            
+                bitrate_kbps = 900 if self.cb_container.currentText() == 'flac' else 1411 if self.cb_container.currentText() == 'wav' else int(self.cb_abitrate.currentData() or 192)
             total_filesize = int((bitrate_kbps * 1000 / 8) * total_duration)
 
-        def format_size(size_bytes: int) -> str:
-            if size_bytes <= 0: return "N/A"
-            mb = size_bytes / (1024 * 1024)
-            if mb >= 1024:
-                return f"{mb / 1024:.2f} GB"
-            return f"{mb:.2f} MB"
-
-        def format_duration(seconds: float) -> str:
-            s = int(seconds)
-            if s <= 0: return "N/A"
-            mins, secs = divmod(s, 60)
-            hrs, mins = divmod(mins, 60)
-            if hrs > 0: return f"{hrs:02d}:{mins:02d}:{secs:02d}"
-            return f"{mins:02d}:{secs:02d}"
-
-        html_parts = []
-
-        if is_playlist:
-            html_parts.append(f"<b>Duração Total:</b> {format_duration(total_duration)}")
-            html_parts.append(f"<b>Tamanho Projetado:</b> {format_size(total_filesize)}")
-            html_parts.append(f"<b>Total de Nós (Faixas):</b> {len(children)}")
-            html_parts.append("<b>Topologia:</b> Conjunto de Dados Escalar (Playlist/Álbum)")
-        else:
-            html_parts.append(f"<b>Duração:</b> {format_duration(total_duration)}")
-            html_parts.append(f"<b>Tamanho Projetado:</b> {format_size(total_filesize)}")
-            
-            if is_spotify_ytm:
-                album = getattr(meta, 'album', '') or 'Desconhecido'
-                date = getattr(meta, 'upload_date', '') or 'N/A'
-                html_parts.append(f"<b>Álbum:</b> {album}")
-                html_parts.append(f"<b>Lançamento:</b> {date}")
-                html_parts.append("<b>Topologia:</b> Fonograma Master (DRM/Áudio)")
-            elif is_soundcloud:
-                canal = getattr(meta, 'channel', '') or getattr(meta, 'artist', 'Desconhecido')
-                html_parts.append(f"<b>Uploader (SC):</b> {canal}")
-                html_parts.append("<b>Topologia:</b> Áudio de Plataforma Fechada")
-            elif getattr(meta, 'width', None) is not None:
-                res = f"{meta.width}x{meta.height} @ {getattr(meta, 'fps', 'N/A')}fps"
-                canal = getattr(meta, 'channel', '') or 'Desconhecido'
-                html_parts.append(f"<b>Matriz de Vídeo:</b> {res}")
-                html_parts.append(f"<b>Canal (YT):</b> {canal}")
-            else:
-                canal = getattr(meta, 'channel', '') or 'Desconhecido'
-                html_parts.append(f"<b>Canal:</b> {canal}")
-
+        html_parts = [
+            f"<b>Duração Total:</b> {int(total_duration//60)}:{int(total_duration%60):02d}",
+            f"<b>Tamanho Projetado:</b> {total_filesize / (1024*1024):.2f} MB",
+            f"<b>Total de Nós:</b> {len(children) if is_playlist else 1}"
+        ]
         self.stats_lbl.setText("<br>".join(html_parts))
 
     def get_config_delta(self) -> Dict[str, Any]:
-        if sip.isdeleted(self) or sip.isdeleted(self.tabs):
-            return {}
-
-        asr_data = self.cb_asr.currentData() if not sip.isdeleted(self.cb_asr) else "auto"
-        audio_sample_rate = 0 if asr_data == "auto" else int(asr_data)
+        if sip.isdeleted(self): return {}
+        asr = self.cb_asr.currentData()
+        bd = self.cb_bitdepth.currentText().split('-')[0]
+        tmpl = self.in_output_tmpl.text().strip()
+        if tmpl.endswith(".%(ext)s"): tmpl = tmpl[:-8]
         
-        bitdepth_text = self.cb_bitdepth.currentText() if not sip.isdeleted(self.cb_bitdepth) else "Auto"
-        audio_bit_depth = bitdepth_text.split('-')[0] if "bit" in bitdepth_text else "auto"
-
-        raw_tmpl = self.in_output_tmpl.text().strip() if not sip.isdeleted(self.in_output_tmpl) else ""
-        backend_tmpl = raw_tmpl
-        if backend_tmpl.endswith(".%(ext)s"):
-            backend_tmpl = backend_tmpl[:-8]
-        elif backend_tmpl.endswith(".%(ext)"):
-            backend_tmpl = backend_tmpl[:-7]
-
-        is_batch = not self.tabs.isTabEnabled(1)
-        preview_name = self.in_filename.text().strip()
-        ext = self.cb_container.currentText() if not sip.isdeleted(self.cb_container) else ""
-        
-        if preview_name.endswith(f".{ext}"):
-            preview_name = preview_name[:-(len(ext)+1)]
-            
-        final_custom_filename = "" if is_batch else preview_name
-
         return {
             'media_type': proc.MediaType.VIDEO if self.rb_video.isChecked() else proc.MediaType.AUDIO,
-            'format_container': self.cb_container.currentText() if not sip.isdeleted(self.cb_container) else "mp3",
-            'video_codec': self.cb_vcodec.currentText().lower() if not sip.isdeleted(self.cb_vcodec) else "best",
-            'audio_codec': self.cb_acodec.currentText().lower() if not sip.isdeleted(self.cb_acodec) else "best",
-            'quality_preset': self.cb_quality.currentText() if not sip.isdeleted(self.cb_quality) else "Best",
-            'audio_bitrate': self.cb_abitrate.currentData() if not sip.isdeleted(self.cb_abitrate) and self.cb_abitrate.isEnabled() else "0",
-            'audio_sample_rate': audio_sample_rate,
-            'audio_bit_depth': audio_bit_depth, 
-            'custom_filename': final_custom_filename,
-            
-            'output_template': backend_tmpl,
-            'ffmpeg_path': self.in_ffmpeg_path.text().strip() if not sip.isdeleted(self.in_ffmpeg_path) else "",
-            'custom_flags': self.in_custom_flags.text().strip() if not sip.isdeleted(self.in_custom_flags) else "",
-            
-            'meta_title': self.in_title.text() if not sip.isdeleted(self.in_title) else "",
-            'meta_artist': self.in_artist.text() if not sip.isdeleted(self.in_artist) else "",
-            'meta_album': self.in_album.text() if not sip.isdeleted(self.in_album) else "",
-            'meta_genre': self.in_genre.text() if not sip.isdeleted(self.in_genre) else "",
-            'meta_date': self.in_date.text() if not sip.isdeleted(self.in_date) else "",
-            'meta_desc': self.in_desc.toPlainText() if not sip.isdeleted(self.in_desc) else "",
-            'embed_meta': self.chk_meta.isChecked() if not sip.isdeleted(self.chk_meta) else True,
-            'embed_thumb': self.chk_thumb.isChecked() if not sip.isdeleted(self.chk_thumb) else True,
-            'embed_subs': self.chk_subs.isChecked() if not sip.isdeleted(self.chk_subs) else False,
-            'norm_audio': self.chk_norm.isChecked() if not sip.isdeleted(self.chk_norm) else False,
-            'use_cookies': self.chk_cookies.isChecked() if not sip.isdeleted(self.chk_cookies) else False,
-            'local_custom_cover': getattr(self, '_local_custom_cover_path', "")
+            'format_container': self.cb_container.currentText(),
+            'video_codec': self.cb_vcodec.currentText().lower(),
+            'audio_codec': self.cb_acodec.currentText().lower(),
+            'quality_preset': self.cb_quality.currentText(),
+            'audio_bitrate': self.cb_abitrate.currentData() if self.cb_abitrate.isEnabled() else "0",
+            'audio_sample_rate': 0 if asr == "auto" else int(asr),
+            'audio_bit_depth': "auto" if bd == "Auto" else bd, 
+            'custom_filename': "" if not self.tabs.isTabEnabled(1) else self.in_filename.text().strip(),
+            'output_template': tmpl,
+            'ffmpeg_path': self.in_ffmpeg_path.text().strip(),
+            'custom_flags': self.in_custom_flags.text().strip(),
+            'meta_title': self.in_title.text(),
+            'meta_artist': self.in_artist.text(),
+            'meta_album': self.in_album.text(),
+            'meta_genre': self.in_genre.text(),
+            'meta_date': self.in_date.text(),
+            'meta_desc': self.in_desc.toPlainText(),
+            'embed_meta': self.chk_meta.isChecked(),
+            'embed_thumb': self.chk_thumb.isChecked(),
+            'embed_subs': self.chk_subs.isChecked(),
+            'norm_audio': self.chk_norm.isChecked(),
+            'use_cookies': self.chk_cookies.isChecked(),
+            'local_custom_cover': self._local_custom_cover_path
         }
 
 class MainWindow(QMainWindow):
@@ -1716,14 +1572,16 @@ class MainWindow(QMainWindow):
         self.thread_pool = QThreadPool.globalInstance()
         self.thread_pool.setMaxThreadCount(MAX_CONCURRENT_DOWNLOADS)
         
-        self.active_runnables: Dict[str, proc.DownloadWorker] = {}
-        self.job_configs: Dict[str, proc.DownloadJobConfig] = {}
-        self.job_states: Dict[str, proc.DownloadJobState] = {}
-        self._terminal_jobs: Set[str] = set()
+        self._jobs: Dict[str, JobRecord] = {}
+        self._jobs_lock = threading.Lock()
+        self._row_index: Dict[str, int] = {}
+        self._pending_retry_id: Optional[str] = None
         
-        self._current_meta: Optional[proc.NormalizedMediaEntity] = None
-
+        self._current_meta: Optional[EntityStub] = None
+        self._temp_files: List[Path] = []
         self._analysis_cover_path: Optional[Path] = None
+
+        self.settings = QSettings("SoundStreamPro", "Engine")
 
         self.debounce_timer = QTimer(self)
         self.debounce_timer.setSingleShot(True)
@@ -1735,30 +1593,30 @@ class MainWindow(QMainWindow):
         
         self.init_ui()
         self._init_menu_bar()
-        self._apply_theme(is_dark=True)
+        self._apply_theme(True)
+        self._restore_settings()
+
+    def _restore_settings(self) -> None:
+        self.path_input.setText(self.settings.value("output_path", str(DEFAULT_DOWNLOAD_DIR)))
+        default_flags = '--extractor-args "youtube:player_client=android,tv" --match-filter "!is_live" --force-ipv4'
+        self.inspector.in_custom_flags.setText(self.settings.value("custom_flags", default_flags))
+        self.inspector.in_output_tmpl.setText(self.settings.value("output_template", "%(title)s - %(artist)s.%(ext)s"))
+
+    def _save_settings(self) -> None:
+        self.settings.setValue("output_path", self.path_input.text())
+        if not sip.isdeleted(self.inspector):
+            self.settings.setValue("custom_flags", self.inspector.in_custom_flags.text())
+            self.settings.setValue("output_template", self.inspector.in_output_tmpl.text())
 
     def _check_cookie_format(self) -> bool:
         cookie_path = Path("cookies.txt")
-        if not cookie_path.exists():
-            return True
-            
+        if not cookie_path.exists(): return True
         try:
             with open(cookie_path, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read(100)
-                if "# Netscape HTTP Cookie File" not in content:
-                    QMessageBox.critical(
-                        self,
-                        "Erro de Integridade Léxica (Cookies)",
-                        "O ficheiro 'cookies.txt' foi detetado no diretório raiz, contudo, "
-                        "não obedece ao padrão 'Netscape HTTP Cookie File'.\n\n"
-                        "A ausência do cabeçalho causará uma exceção (LoadError) no motor yt-dlp.\n\n"
-                        "Mitigação Recomendada:\n"
-                        "Gere o ficheiro utilizando a extensão de navegador 'Get cookies.txt LOCALLY'."
-                    )
+                if "# Netscape HTTP Cookie File" not in f.read(100):
+                    QMessageBox.critical(self, "Erro de Integridade Léxica", "O ficheiro 'cookies.txt' não obedece ao padrão Netscape HTTP.")
                     return False
-        except Exception as e:
-            logging.warning(f"[I/O] Restrição ao validar heurística de cookies: {e}")
-            
+        except Exception: pass
         return True
 
     @pyqtSlot(str)
@@ -1768,56 +1626,42 @@ class MainWindow(QMainWindow):
     @pyqtSlot()
     def _process_reactive_url(self) -> None:
         url = self.url_input.text().strip()
-        
         if not url or not proc.YtDlpService.validate_url(url):
             self._reset_ui_state()
             return
-
         self.start_analysis()
 
     def _reset_ui_state(self) -> None:
+        self._pending_retry_id = None
         if not sip.isdeleted(self.inspector):
             self.inspector.clear_thumbnail()
             self.inspector.setVisible(False)
         if not sip.isdeleted(self.action_bar):
             self.action_bar.setVisible(False)
+            self.btn_queue.setText("Adicionar à Fila")
         if not sip.isdeleted(self.btn_analyze):
             self.btn_analyze.setEnabled(True)
             self.btn_analyze.setText("Analisar Multimédia")
         self._current_meta = None
-        self._analysis_cover_path = None
 
     def _init_menu_bar(self) -> None:
         menu_bar = self.menuBar()
-        if menu_bar is None: return
-        
+        if not menu_bar: return
         menu_file = menu_bar.addMenu("Ficheiro")
         action_exit = QAction("Sair", self)
         action_exit.triggered.connect(self.close)
         menu_file.addAction(action_exit)
-
-        menu_view = menu_bar.addMenu("Ver")
-        menu_theme = menu_view.addMenu("Tema")
-        
-        action_theme_light = QAction("Claro", self)
-        action_theme_light.triggered.connect(lambda: self._apply_theme(is_dark=False))
-        menu_theme.addAction(action_theme_light)
-        
-        action_theme_dark = QAction("Escuro", self)
-        action_theme_dark.triggered.connect(lambda: self._apply_theme(is_dark=True))
-        menu_theme.addAction(action_theme_dark)
-        
+        menu_view = menu_bar.addMenu("Ver").addMenu("Tema")
+        menu_view.addAction("Claro", lambda: self._apply_theme(False))
+        menu_view.addAction("Escuro", lambda: self._apply_theme(True))
         menu_help = menu_bar.addMenu("Ajuda")
-        action_about = QAction("Sobre", self)
-        action_about.triggered.connect(self._show_about_dialog)
-        menu_help.addAction(action_about)
+        menu_help.addAction("Sobre", self._show_about_dialog)
 
     def _apply_theme(self, is_dark: bool) -> None:
         app = QApplication.instance()
-        if app is not None:
+        if app:
             app.setPalette(ThemeManager.get_palette(is_dark))
             app.setStyleSheet(ThemeManager.get_stylesheet(is_dark))
-            
         self.log_viewer.update_theme_colors(is_dark)
 
     def _show_about_dialog(self) -> None:
@@ -1826,7 +1670,6 @@ class MainWindow(QMainWindow):
     def init_ui(self) -> None:
         central = QWidget(self)
         self.setCentralWidget(central)
-        
         main_splitter = QSplitter(Qt.Orientation.Vertical, central)
         top_container = QWidget(main_splitter)
         main_layout = QVBoxLayout(top_container)
@@ -1835,10 +1678,8 @@ class MainWindow(QMainWindow):
         top_bar = QHBoxLayout()
         header = QLabel(APP_NAME.upper(), top_container)
         header.setObjectName("MainHeader")
-        
         self.chk_dev_mode = QCheckBox("Modo de Desenvolvedor", top_container)
         self.chk_dev_mode.toggled.connect(self.toggle_dev_mode)
-        
         top_bar.addWidget(header)
         top_bar.addStretch()
         top_bar.addWidget(self.chk_dev_mode)
@@ -1849,9 +1690,7 @@ class MainWindow(QMainWindow):
         input_layout = QHBoxLayout(input_frame)
         self.url_input = QLineEdit(input_frame)
         self.url_input.setPlaceholderText("Colar URL...")
-        
         self.url_input.textChanged.connect(self._on_url_text_changed)
-        
         self.btn_analyze = QPushButton("Analisar Multimédia", input_frame)
         self.btn_analyze.setObjectName("PrimaryAction")
         self.btn_analyze.setFixedHeight(40)
@@ -1867,16 +1706,13 @@ class MainWindow(QMainWindow):
         self.action_bar = QFrame(top_container)
         self.action_bar.setVisible(False)
         action_layout = QHBoxLayout(self.action_bar)
-        self.path_input = QLineEdit(str(DEFAULT_DOWNLOAD_DIR), self.action_bar)
+        self.path_input = QLineEdit(self.action_bar)
         self.path_input.setReadOnly(True)
-        
         btn_path = QPushButton("Alterar Pasta", self.action_bar)
         btn_path.clicked.connect(self.browse_folder)
-        
         self.btn_queue = QPushButton("Adicionar à Fila", self.action_bar)
         self.btn_queue.setObjectName("PrimaryAction")
         self.btn_queue.clicked.connect(self.queue_download)
-        
         action_layout.addWidget(QLabel("Pasta de Saída:", self.action_bar))
         action_layout.addWidget(self.path_input)
         action_layout.addWidget(btn_path)
@@ -1888,14 +1724,11 @@ class MainWindow(QMainWindow):
         self.table.setColumnCount(5)
         self.table.setHorizontalHeaderLabels(["Ficheiro / Título", "Formato", "Estado", "Progresso", "Ações"])
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        header_view = self.table.horizontalHeader()
-        if header_view is not None:
-            header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-            header_view.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        
+        if self.table.horizontalHeader():
+            self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_context_menu)
-        
         main_layout.addWidget(self.table)
         
         self.log_viewer = LogViewerWidget(main_splitter)
@@ -1912,143 +1745,86 @@ class MainWindow(QMainWindow):
         final_layout.addWidget(main_splitter)
 
     def _show_context_menu(self, pos: Any) -> None:
-        item = self.table.itemAt(pos)
         menu = QMenu(self)
+        item = self.table.itemAt(pos)
         
         if item is not None:
             row = item.row()
-            cell_item = self.table.item(row, 0)
-            if cell_item is not None:
-                job_id = cell_item.data(Qt.ItemDataRole.UserRole)
-                status_item = self.table.item(row, 2)
-                
-                if status_item and "Concluído" in status_item.text():
-                    action_edit_meta = QAction("Editar Metadados Localmente", self)
-                    action_edit_meta.triggered.connect(lambda _, jid=job_id: self._edit_local_metadata(jid))
-                    menu.addAction(action_edit_meta)
-                
-                action_remove = QAction("Remover da Fila", self)
-                action_remove.triggered.connect(lambda _, jid=job_id: self._remove_from_queue(jid))
-                menu.addAction(action_remove)
-                
-                if job_id in self.active_runnables:
-                    action_cancel = QAction("Cancelar Transferência", self)
-                    action_cancel.triggered.connect(lambda _, jid=job_id: self.cancel_job(jid))
-                    menu.addAction(action_cancel)
-                else:
-                    if status_item and ("Erro" in status_item.text() or "Cancelado" in status_item.text()):
-                        action_retry = QAction("Tentar Novamente", self)
-                        action_retry.triggered.connect(lambda _, jid=job_id: self.retry_job(jid))
-                        menu.addAction(action_retry)
-                    
-                menu.addSeparator()
+            job_id = self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+            status = self.table.item(row, 2).text()
             
-        action_open = QAction("Abrir Pasta de Saída", self)
-        action_open.triggered.connect(self.open_output_folder)
-        menu.addAction(action_open)
-        
-        action_clear = QAction("Limpar Concluídos", self)
-        action_clear.triggered.connect(self._clear_finished_jobs)
-        menu.addAction(action_clear)
-        
-        viewport = self.table.viewport()
-        if viewport is not None:
-            menu.exec(viewport.mapToGlobal(pos))
+            if "Concluído" in status:
+                menu.addAction("Editar Metadados Localmente", lambda: self._edit_local_metadata(job_id))
+            menu.addAction("Remover da Fila", lambda: self._remove_from_queue(job_id))
+            
+            with self._jobs_lock:
+                record = self._jobs.get(job_id)
+                if record and record.runnable:
+                    menu.addAction("Cancelar Transferência", lambda: self.cancel_job(job_id))
+                elif "Erro" in status or "Cancelado" in status:
+                    menu.addAction("Tentar Novamente", lambda: self.retry_job(job_id))
+            menu.addSeparator()
+            
+        menu.addAction("Abrir Pasta de Saída", self.open_output_folder)
+        menu.addAction("Limpar Concluídos", self._clear_finished_jobs)
+        menu.exec(self.table.viewport().mapToGlobal(pos))
 
     def _edit_local_metadata(self, job_id: str) -> None:
-        config = self.job_configs.get(job_id)
-        state = self.job_states.get(job_id)
-        if not config or not state: return
+        with self._jobs_lock:
+            record = self._jobs.get(job_id)
+            if not record: return
+            config, state = record.config, record.state
+            
+        filepath = Path(state.resolved_output_path) if state.resolved_output_path else Path(config.output_path) / f"{state.custom_filename}.{config.format_container}"
         
-        if state.resolved_output_path and Path(state.resolved_output_path).exists():
-            filepath = Path(state.resolved_output_path)
-        else:
-            safe_name = re.sub(r'[\\/*?:"<>|]', '_', state.custom_filename)
-            filepath = Path(config.output_path) / f"{safe_name}.{config.format_container}"
-            if not filepath.exists():
-                candidates = list(Path(config.output_path).glob(f"*.{config.format_container}"))
-                if candidates:
-                    filepath = max(candidates, key=lambda p: p.stat().st_mtime)
-        
-        if not filepath or not filepath.exists():
-            QMessageBox.warning(self, "Aviso", f"O ficheiro físico não se encontra na topologia indexada:\n{filepath}")
+        if not filepath.exists():
+            QMessageBox.warning(self, "Aviso", f"O ficheiro não foi localizado:\n{filepath}")
             return
             
-        initial_data = {
-            'meta_title': config.meta_title,
-            'meta_artist': config.meta_artist,
-            'meta_album': config.meta_album,
-            'meta_genre': config.meta_genre,
-            'meta_date': config.meta_date,
-            'meta_desc': config.meta_desc,
-        }
-            
-        dialog = LocalMetadataEditorDialog(str(filepath), initial_data, self)
+        init_data = {'meta_title': config.meta_title, 'meta_artist': config.meta_artist, 'meta_album': config.meta_album, 'meta_genre': config.meta_genre, 'meta_date': config.meta_date, 'meta_desc': config.meta_desc}
+        dialog = LocalMetadataEditorDialog(str(filepath), init_data, self)
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.new_filepath:
-            state.custom_filename = dialog.new_filepath.stem
-            state.resolved_output_path = str(dialog.new_filepath)
-            
-            new_config = replace(config,
-                meta_title=dialog.in_title.text(),
-                meta_artist=dialog.in_artist.text(),
-                meta_album=dialog.in_album.text(),
-                meta_genre=dialog.in_genre.text(),
-                meta_date=dialog.in_date.text(),
-                meta_desc=dialog.in_desc.toPlainText()
-            )
-            self.job_configs[job_id] = new_config
-            
+            with self._jobs_lock:
+                state.custom_filename = dialog.new_filepath.stem
+                state.resolved_output_path = str(dialog.new_filepath)
+                record.config = replace(config, meta_title=dialog.in_title.text(), meta_artist=dialog.in_artist.text(), meta_album=dialog.in_album.text())
             row = self.get_row_by_id(job_id)
             if row >= 0:
-                item = self.table.item(row, 0)
-                if item is not None:
-                    item.setText(dialog.new_filepath.name)
-                    item.setToolTip(dialog.in_title.text())
+                self.table.item(row, 0).setText(dialog.new_filepath.name)
 
     def _remove_from_queue(self, job_id: str) -> None:
-        if job_id in self.active_runnables:
-            self.active_runnables[job_id].cancel()
-            self._terminal_jobs.add(job_id)
+        with self._jobs_lock:
+            record = self._jobs.pop(job_id, None)
+            if record:
+                if record.runnable: record.runnable.cancel()
+                record.is_terminal = True
             
-        if job_id in self.job_configs:
-            del self.job_configs[job_id]
-        if job_id in self.job_states:
-            del self.job_states[job_id]
-            
-        row = self.get_row_by_id(job_id)
+        row = self._row_index.pop(job_id, -1)
         if row >= 0:
             self.table.removeRow(row)
+            for jid in list(self._row_index.keys()):
+                if self._row_index[jid] > row: self._row_index[jid] -= 1
 
     def _clear_finished_jobs(self) -> None:
-        for row in range(self.table.rowCount() - 1, -1, -1):
-            status_item = self.table.item(row, 2)
-            if status_item is not None and status_item.text() in ["✔ Concluído", "✘ Erro", "Cancelado"]:
-                job_id = self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
-                if job_id in self.job_configs:
-                    del self.job_configs[job_id]
-                if job_id in self.job_states:
-                    del self.job_states[job_id]
-                self.table.removeRow(row)
+        to_remove = []
+        for row in range(self.table.rowCount()):
+            if self.table.item(row, 2) and self.table.item(row, 2).text() in ["✔ Concluído", "✘ Erro", "Cancelado"]:
+                to_remove.append(self.table.item(row, 0).data(Qt.ItemDataRole.UserRole))
+        for jid in reversed(to_remove):
+            self._remove_from_queue(jid)
 
     def toggle_dev_mode(self, checked: bool) -> None:
-        logging.getLogger().setLevel(logging.DEBUG if checked else logging.INFO)
         self.log_viewer.setVisible(checked)
+        logging.getLogger().setLevel(logging.DEBUG if checked else logging.INFO)
 
     def start_analysis(self) -> None:
         url = self.url_input.text().strip()
-        if not url: return
+        if not url or not self._check_cookie_format(): return
         
-        if not self._check_cookie_format():
-            self._reset_ui_state()
-            return
-        
-        if not sip.isdeleted(self.inspector):
-            self.inspector.clear_thumbnail()
-            
         self.inspector._current_source_url = url
-        
         self.btn_analyze.setEnabled(False)
         self.btn_analyze.setText("A processar...")
+        
         worker = proc.AnalysisWorker(url)
         worker.signals.result.connect(self.on_analysis_success)
         worker.signals.thumbnail_data.connect(self.on_thumbnail_ready)
@@ -2058,9 +1834,7 @@ class MainWindow(QMainWindow):
         self.thread_pool.start(worker)
 
     @pyqtSlot(object)
-    def on_analysis_success(self, meta: proc.NormalizedMediaEntity) -> None:
-        if sip.isdeleted(self) or sip.isdeleted(self.inspector): return
-
+    def on_analysis_success(self, meta: Any) -> None:
         if getattr(meta, 'is_playlist', False) and getattr(meta, 'children', []):
             dialog = PlaylistStagingDialog(meta.children, self)
             if dialog.exec() == QDialog.DialogCode.Accepted:
@@ -2069,7 +1843,6 @@ class MainWindow(QMainWindow):
                     self._reset_ui_state()
                     QMessageBox.information(self, "Operação Revogada", "A transação foi abortada: Nenhum sub-nó foi selecionado.")
                     return
-                
                 meta = replace(meta, children=selected_children)
             else:
                 self._reset_ui_state()
@@ -2077,98 +1850,74 @@ class MainWindow(QMainWindow):
 
         self._current_meta = meta
         self.inspector.set_metadata(meta)
-        
-        if not sip.isdeleted(self.inspector):
-            self.inspector.setVisible(True)
-        if not sip.isdeleted(self.action_bar):
-            self.action_bar.setVisible(True)
+        self.inspector.setVisible(True)
+        self.action_bar.setVisible(True)
 
     @pyqtSlot(bytes)
     def on_thumbnail_ready(self, data: bytes) -> None:
-        if sip.isdeleted(self) or sip.isdeleted(self.inspector): return
+        if sip.isdeleted(self.inspector): return
         
-        import tempfile
-        cache_dir = Path(tempfile.gettempdir())
-        self._analysis_cover_path = cache_dir / f"cover_sndstream_yt_{uuid.uuid4().hex[:8]}.jpg"
+        if shutil.disk_usage(tempfile.gettempdir()).free < 5_000_000:
+            logging.warning("[I/O] Espaço em disco insuficiente para cache de miniaturas.")
+            return
+
+        self._analysis_cover_path = Path(tempfile.NamedTemporaryFile(delete=False, suffix=".jpg", prefix="cover_sndstream_").name)
+        self._temp_files.append(self._analysis_cover_path)
         
         pixmap = QPixmap()
         if pixmap.loadFromData(data):
-            safe_image = pixmap.toImage().convertToFormat(QImage.Format.Format_RGB32)
-            safe_image.save(str(self._analysis_cover_path), "JPG", 95)
-        
-        if not getattr(self.inspector, '_local_custom_cover_path', None):
-            self.inspector.set_thumbnail(pixmap)
+            pixmap.toImage().convertToFormat(QImage.Format.Format_RGB32).save(str(self._analysis_cover_path), "JPG", 95)
+            if not self.inspector._local_custom_cover_path:
+                self.inspector.set_thumbnail(pixmap)
 
     @pyqtSlot(str)
     def on_analysis_error(self, err_msg: str) -> None:
-        if sip.isdeleted(self): return
         QMessageBox.critical(self, "Falha na Análise", err_msg)
-        if not sip.isdeleted(self.inspector):
-            self.inspector.setVisible(False)
-        if not sip.isdeleted(self.action_bar):
-            self.action_bar.setVisible(False)
+        self._reset_ui_state()
 
     def browse_folder(self) -> None:
-        d = QFileDialog.getExistingDirectory(self, "Localização de Guarda", self.path_input.text())
-        if d: self.path_input.setText(d)
+        if d := QFileDialog.getExistingDirectory(self, "Localização de Guarda", self.path_input.text()):
+            self.path_input.setText(d)
 
     def open_output_folder(self) -> None:
-        path_str = self.path_input.text()
-        if path_str:
-            path_obj = Path(path_str)
-            if path_obj.exists() and path_obj.is_dir():
-                QDesktopServices.openUrl(QUrl.fromLocalFile(str(path_obj)))
-            else:
-                QMessageBox.warning(self, "Aviso", "O diretório especificado não existe ou está inacessível.")
+        path = Path(self.path_input.text())
+        if path.exists() and path.is_dir(): QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
     def queue_download(self) -> None:
-        if not self._current_meta: return
-        if not self._check_cookie_format(): return
-        
+        if self._pending_retry_id:
+            with self._jobs_lock:
+                record = self._jobs.get(self._pending_retry_id)
+                config, state = record.config, record.state
+            self._spawn_download(config, state, is_retry=False)
+            self._reset_ui_state()
+            self.url_input.clear()
+            return
+            
+        if not self._current_meta or not self._check_cookie_format(): return
         data = self.inspector.get_config_delta()
-        if not data: return
         
-        is_playlist_mode = getattr(self._current_meta, 'is_playlist', False)
-        entities_to_process: List[proc.NormalizedMediaEntity] = (
-            self._current_meta.children if is_playlist_mode and self._current_meta.children
-            else [self._current_meta]
-        )
-
-        for entity in entities_to_process:
+        is_playlist = getattr(self._current_meta, 'is_playlist', False)
+        for entity in (self._current_meta.children if is_playlist else [self._current_meta]):
             job_id = str(uuid.uuid4())
-            target_url = str(getattr(entity, 'original_id', ''))
-            
+            target_url = UrlResolver.resolve_download_url(entity, getattr(entity, 'original_id', ''))
             source_url = getattr(self.inspector, '_current_source_url', '')
-            is_audio_centric = getattr(entity, 'is_search_query', False) or "music.youtube" in target_url or "spotify" in target_url or "soundcloud" in target_url or "music.youtube" in source_url or "spotify" in source_url or "soundcloud" in source_url
             
-            current_media_type = data['media_type']
-            current_format = data['format_container']
-            
+            is_audio_centric = getattr(entity, 'is_search_query', False) or any(x in str(target_url).lower() for x in ['ytmsearch', 'ytsearch', 'music.youtube', 'soundcloud']) or any(x in source_url.lower() for x in ['spotify', 'music.youtube', 'soundcloud'])
             if is_audio_centric:
-                current_media_type = proc.MediaType.AUDIO
-                if current_format in ['mp4', 'mkv', 'webm', 'avi']:
-                    current_format = 'mp3' 
+                data['media_type'] = proc.MediaType.AUDIO
+                if data['format_container'] in ['mp4', 'mkv', 'webm', 'avi']: data['format_container'] = 'mp3'
             
-            if getattr(entity, 'is_search_query', False) or target_url.startswith("ytmsearch") or target_url.startswith("ytsearch"):
-                query = target_url.split(":", 1)[-1] if ":" in target_url else target_url
-                target_url = f'ytsearch5:{query.strip()} "Provided to YouTube"'
-                
-            elif not target_url.startswith("http") and not target_url.startswith("ytsearch"):
-                target_url = f"https://www.youtube.com/watch?v={target_url}"
-
-            final_title = data.get('meta_title', '').strip() if (not is_playlist_mode and data.get('meta_title')) else (entity.title or "")
-            final_artist = data.get('meta_artist', '').strip() if (not is_playlist_mode and data.get('meta_artist')) else (entity.artist or "")
-            final_album = data.get('meta_album', '').strip() if (not is_playlist_mode and data.get('meta_album')) else (entity.album or "")
-            final_genre = data.get('meta_genre', '').strip() if (not is_playlist_mode and data.get('meta_genre')) else getattr(entity, 'genre', '')
-            final_date = data.get('meta_date', '').strip() if (not is_playlist_mode and data.get('meta_date')) else (getattr(entity, 'upload_date', '') or '')
-            final_desc = data.get('meta_desc', '').strip() if (not is_playlist_mode and data.get('meta_desc')) else (getattr(entity, 'description', '') or '')
+            final_title = data.get('meta_title', '').strip() if (not is_playlist and data.get('meta_title')) else getattr(entity, 'title', '')
+            final_artist = data.get('meta_artist', '').strip() if (not is_playlist and data.get('meta_artist')) else getattr(entity, 'artist', '')
+            final_album = data.get('meta_album', '').strip() if (not is_playlist and data.get('meta_album')) else getattr(entity, 'album', '')
+            final_genre = data.get('meta_genre', '').strip() if (not is_playlist and data.get('meta_genre')) else getattr(entity, 'genre', '')
+            final_date = data.get('meta_date', '').strip() if (not is_playlist and data.get('meta_date')) else (getattr(entity, 'upload_date', '') or '')
+            final_desc = data.get('meta_desc', '').strip() if (not is_playlist and data.get('meta_desc')) else (getattr(entity, 'description', '') or '')
 
             resolved_filename = data.get('custom_filename', '').strip()
-            if is_playlist_mode or not resolved_filename:
-                tmpl = data.get('output_template', '%(title)s - %(artist)s')
-                if not tmpl:
-                    tmpl = "%(title)s - %(artist)s"
-                    
+            
+            if is_playlist or not resolved_filename:
+                tmpl = data.get('output_template', '') or "%(title)s - %(artist)s"
                 mapping = {
                     'title': final_title,
                     'artist': final_artist,
@@ -2176,291 +1925,212 @@ class MainWindow(QMainWindow):
                     'album': final_album,
                     'genre': final_genre,
                     'release_year': final_date[:4] if final_date else "",
-                    'upload_date': final_date[:4] if final_date else ""
+                    'upload_date': final_date[:4] if final_date else "",
+                    'ext': data['format_container']
                 }
-                
                 def safe_sub(match: re.Match) -> str:
                     key = match.group(1)
                     val = mapping.get(key, f"%({key})s")
                     return re.sub(r'[<>:"/\\|?*]', '', str(val))
                     
                 res = re.sub(r'%\(([^)]+)\)s', safe_sub, tmpl)
-                res = re.sub(r'%\([^)]+\)s', '', res)
-                res = re.sub(r'\s+', ' ', res).strip(' -_')
-                resolved_filename = res or "output_stream"
+                res = re.sub(r'%\([^)]+\)s', '', res) # Remove variáveis não resolvidas
+                resolved_filename = re.sub(r'\s+', ' ', res).strip(' -_')
 
+            ext = data['format_container']
+            if resolved_filename.lower().endswith(f".{ext.lower()}"):
+                resolved_filename = resolved_filename[:-(len(ext) + 1)]
+                
+            if not resolved_filename:
+                resolved_filename = "output_stream"
+                
             config = proc.DownloadJobConfig(
-                job_id=job_id,
-                url=target_url,
-                output_path=Path(self.path_input.text()),
-                media_type=current_media_type,
-                format_container=current_format,
-                audio_codec=data['audio_codec'],
-                video_codec=data['video_codec'],
-                quality_preset=data['quality_preset'],
-                audio_sample_rate=data['audio_sample_rate'],
-                audio_bitrate=str(data['audio_bitrate']),
-                audio_bit_depth=data.get('audio_bit_depth', 'auto'),
-                output_template=data.get('output_template', ''),
-                ffmpeg_path=data.get('ffmpeg_path', ''),
-                custom_flags=data.get('custom_flags', ''),
-                meta_title=final_title,
-                meta_artist=final_artist,
-                meta_album=final_album,
-                meta_genre=final_genre,
-                meta_date=final_date,
-                meta_desc=final_desc,
-                embed_metadata=data['embed_meta'],
-                embed_thumbnail=data['embed_thumb'],
-                embed_subs=data['embed_subs'],
-                normalize_audio=data['norm_audio'],
-                use_browser_cookies=data['use_cookies'],
-                spotify_thumb_url=getattr(entity, 'thumbnail_url', None)
+                job_id=job_id, url=target_url, output_path=Path(self.path_input.text()),
+                media_type=data['media_type'], format_container=data['format_container'],
+                audio_codec=data['audio_codec'], video_codec=data['video_codec'],
+                quality_preset=data['quality_preset'], audio_sample_rate=data['audio_sample_rate'],
+                audio_bitrate=str(data['audio_bitrate']), audio_bit_depth=data['audio_bit_depth'],
+                output_template=data['output_template'], ffmpeg_path=data['ffmpeg_path'],
+                custom_flags=data['custom_flags'], meta_title=final_title,
+                meta_artist=final_artist, meta_album=final_album,
+                meta_genre=final_genre, meta_date=final_date, meta_desc=final_desc,
+                embed_metadata=data['embed_meta'], embed_thumbnail=data['embed_thumb'],
+                embed_subs=data['embed_subs'], normalize_audio=data['norm_audio'],
+                use_browser_cookies=data['use_cookies'], spotify_thumb_url=getattr(entity, 'thumbnail_url', None)
             )
-
-            user_local_cover = data.get('local_custom_cover', '')
-            analysis_cover = self._analysis_cover_path
-            final_cover = user_local_cover if user_local_cover else analysis_cover
             
             state = proc.DownloadJobState(
                 custom_filename=resolved_filename,
-                custom_cover_path=str(final_cover) if final_cover else None
+                custom_cover_path=data['local_custom_cover'] or (str(self._analysis_cover_path) if self._analysis_cover_path else None)
             )
             
-            self.job_configs[job_id] = config
-            self.job_states[job_id] = state
-            self._spawn_download(config, state, is_retry=False)
-        
-        if not sip.isdeleted(self.inspector):
-            self.inspector.setVisible(False)
-        if not sip.isdeleted(self.action_bar):
-            self.action_bar.setVisible(False)
+            with self._jobs_lock:
+                self._jobs[job_id] = JobRecord(config=config, state=state)
+            self._spawn_download(config, state, False)
+            
+        self._reset_ui_state()
         self.url_input.clear()
 
     def retry_job(self, job_id: str) -> None:
-        if job_id in self._terminal_jobs:
-            self._terminal_jobs.remove(job_id)
-            
-        config = self.job_configs.get(job_id)
-        state = self.job_states.get(job_id)
-        if not config or not state: return
-        
-        self.url_input.blockSignals(True)
-        self.url_input.setText(config.url)
-        self.url_input.blockSignals(False)
-        
-        if not sip.isdeleted(self.inspector):
-            self.inspector.load_from_config(config, state)
-            self._current_meta = self.inspector._current_meta 
-            self.inspector.setVisible(True)
-            
-        if not sip.isdeleted(self.action_bar):
-            self.action_bar.setVisible(True)
+        with self._jobs_lock:
+            record = self._jobs.get(job_id)
+            if not record: return
+            config = record.config
+            state = copy.deepcopy(record.state)
             
         self._remove_from_queue(job_id)
         
+        new_id = str(uuid.uuid4())
+        new_config = replace(config, job_id=new_id)
+        
+        with self._jobs_lock:
+            self._jobs[new_id] = JobRecord(config=new_config, state=state)
+            
+        self.inspector.load_from_config(new_config, state)
+        self._current_meta = self.inspector._current_meta
+        self.inspector.setVisible(True)
+        self.action_bar.setVisible(True)
+        self.btn_queue.setText("Confirmar Retentativa")
+        self._pending_retry_id = new_id
 
-    def _spawn_download(self, config: proc.DownloadJobConfig, state: proc.DownloadJobState, is_retry: bool = False) -> None:
+    def _spawn_download(self, config: proc.DownloadJobConfig, state: proc.DownloadJobState, is_retry: bool) -> None:
         runnable = proc.DownloadWorker(config)
         runnable.state = state
-        
         runnable.signals.progress.connect(self.update_progress)
         runnable.signals.status.connect(self.update_status)
         runnable.signals.finished.connect(lambda: self.on_job_finished(config.job_id))
         runnable.signals.error.connect(lambda err: self.on_job_error(config.job_id, err))
-        self.active_runnables[config.job_id] = runnable
         
-        if is_retry:
-            row = self.get_row_by_id(config.job_id)
-            if row >= 0:
-                self._reset_row_for_retry(row, config.job_id)
-        else:
-            self.add_table_row(config, state)
+        with self._jobs_lock:
+            if config.job_id in self._jobs:
+                self._jobs[config.job_id].runnable = runnable
+            
+        if not is_retry:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            self._row_index[config.job_id] = row
+            
+            display = f"{state.custom_filename}.{config.format_container}"
+            self.table.setItem(row, 0, QTableWidgetItem(display))
+            self.table.item(row, 0).setData(Qt.ItemDataRole.UserRole, config.job_id)
+            
+            fmt_display = config.format_container.upper()
+            if config.media_type == proc.MediaType.VIDEO: fmt_display += f" ({config.quality_preset})"
+            self.table.setItem(row, 1, QTableWidgetItem(fmt_display))
+            self.table.setItem(row, 2, QTableWidgetItem("Na Fila"))
+            
+            pbar = QProgressBar()
+            pbar.setValue(0)
+            self.table.setCellWidget(row, 3, pbar)
+            
+            btn_cancel = QPushButton("Parar")
+            btn_cancel.setObjectName("Destructive")
+            btn_cancel.clicked.connect(lambda _, jid=config.job_id: self.cancel_job(jid))
+            
+            container = QWidget()
+            layout = QHBoxLayout(container)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.addWidget(btn_cancel)
+            self.table.setCellWidget(row, 4, container)
             
         self.thread_pool.start(runnable)
 
-    def _reset_row_for_retry(self, row: int, job_id: str) -> None:
-        btn_cancel = QPushButton("Parar")
-        btn_cancel.setObjectName("Destructive")
-        btn_cancel.clicked.connect(lambda _, jid=job_id: self.cancel_job(jid))
-        
-        layout = QHBoxLayout()
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(btn_cancel)
-        container = QWidget()
-        container.setLayout(layout)
-        
-        self.table.setCellWidget(row, 4, container)
-
-    def add_table_row(self, config: proc.DownloadJobConfig, state: proc.DownloadJobState) -> None:
-        row = self.table.rowCount()
-        self.table.insertRow(row)
-        
-        display_name = state.custom_filename if state.custom_filename else "Em processamento"
-        if display_name and config.format_container:
-            display_name = f"{display_name}.{config.format_container}"
-            
-        title_item = QTableWidgetItem(display_name)
-        title_item.setToolTip(config.meta_title)
-        title_item.setData(Qt.ItemDataRole.UserRole, config.job_id)
-        
-        fmt_str = config.format_container.upper()
-        if config.media_type == proc.MediaType.VIDEO:
-            fmt_str += f" ({config.quality_preset})"
-            
-        pbar = QProgressBar()
-        pbar.setValue(0)
-        
-        btn_layout = QHBoxLayout()
-        btn_layout.setContentsMargins(0, 0, 0, 0)
-        btn_container = QWidget()
-        
-        btn_cancel = QPushButton("Parar")
-        btn_cancel.setObjectName("Destructive")
-        btn_cancel.clicked.connect(lambda _, jid=config.job_id: self.cancel_job(jid))
-        
-        btn_layout.addWidget(btn_cancel)
-        btn_container.setLayout(btn_layout)
-        
-        self.table.setItem(row, 0, title_item)
-        self.table.setItem(row, 1, QTableWidgetItem(fmt_str))
-        self.table.setItem(row, 2, QTableWidgetItem("Na Fila"))
-        self.table.setCellWidget(row, 3, pbar)
-        self.table.setCellWidget(row, 4, btn_container)
-
     def get_row_by_id(self, job_id: str) -> int:
-        for r in range(self.table.rowCount()):
-            item = self.table.item(r, 0)
-            if item is not None and item.data(Qt.ItemDataRole.UserRole) == job_id: return r
-        return -1
+        return self._row_index.get(job_id, -1)
 
     @pyqtSlot(str, float, str)
     def update_progress(self, job_id: str, pct: float, speed: str) -> None:
-        if sip.isdeleted(self) or sip.isdeleted(self.table): return
-        row = self.get_row_by_id(job_id)
-        if row >= 0:
-            widget = self.table.cellWidget(row, 3)
-            if isinstance(widget, QProgressBar):
-                widget.setValue(int(pct))
-            
-            item = self.table.item(row, 2)
-            if item is not None:
-                item.setText(f"▼ {speed}")
+        if (row := self.get_row_by_id(job_id)) >= 0:
+            if isinstance(w := self.table.cellWidget(row, 3), QProgressBar): w.setValue(int(pct))
+            if i := self.table.item(row, 2): i.setText(f"▼ {speed}")
 
     @pyqtSlot(str, str)
     def update_status(self, job_id: str, msg: str) -> None:
-        if sip.isdeleted(self) or sip.isdeleted(self.table): return
-        row = self.get_row_by_id(job_id)
-        if row >= 0:
-            item = self.table.item(row, 2)
-            if item is not None:
-                item.setText(msg)
+        if (row := self.get_row_by_id(job_id)) >= 0:
+            if i := self.table.item(row, 2): i.setText(msg)
 
     def on_job_finished(self, job_id: str) -> None:
-        if sip.isdeleted(self): return
-        if job_id in self._terminal_jobs: return
+        with self._jobs_lock:
+            record = self._jobs.get(job_id)
+            if not record or record.is_terminal: return
         self._cleanup_job(job_id, "✔ Concluído", QColor("#4caf50"))
 
     def on_job_error(self, job_id: str, err: str) -> None:
-        if sip.isdeleted(self): return
-        
-        self._terminal_jobs.add(job_id)
+        with self._jobs_lock:
+            record = self._jobs.get(job_id)
+            if record: record.is_terminal = True
         self._cleanup_job(job_id, "✘ Erro", QColor("#d32f2f"))
-
-        err_lower = err.lower()
-        is_cdn_block = "googlevideo.com" in err_lower and ("timed out" in err_lower or "timeout" in err_lower)
-        is_custom_exc = "NetworkBlockedCDNError" in err
         
-        if is_cdn_block or is_custom_exc:
+        if "NetworkBlockedCDNError" in err or "timeout" in err.lower():
             mitigation_html = (
                 "<p>A extração colapsou devido a uma restrição de pacotes (Timeout) no nó de Distribuição de Conteúdo (CDN).</p>"
                 "<p>Este comportamento é característico de <b>Redes Corporativas</b> ou académicas equipadas com firewalls restritivos (Inspeção Profunda de Pacotes).</p>"
-                "<br>"
-                "<b>Estratégias de Mitigação:</b>"
-                "<ul>"
-                "<li><b>Alterar Topologia de Rede:</b> Migrar o host para uma rede externa (ex: Hotspot 4G/5G).</li>"
-                "<li><b>Tunelamento Criptográfico (VPN):</b> Ofuscar o tráfego da camada de transporte encapsulando a conexão.</li>"
-                "<li><b>Configurar Proxy HTTP/SOCKS:</b> No painel de Configuração Avançada, em <i>Parâmetros do Motor</i>, ative a flag <code>--proxy</code> e defina um nó de saída seguro.</li>"
-                "</ul>"
+                "<br><b>Estratégias de Mitigação:</b><ul>"
+                "<li><b>Alterar Topologia de Rede:</b> Migrar o host para uma rede externa (ex: Hotspot).</li>"
+                "<li><b>Tunelamento Criptográfico (VPN):</b> Ofuscar o tráfego encapsulando a conexão.</li>"
+                "<li><b>Configurar Proxy HTTP/SOCKS:</b> Ative a flag <code>--proxy</code> e defina um nó de saída seguro.</li></ul>"
             )
-            
             msg_box = QMessageBox(self)
             msg_box.setIcon(QMessageBox.Icon.Warning)
-            msg_box.setWindowTitle("Anomalia de Transporte: Bloqueio de Infraestrutura")
+            msg_box.setWindowTitle("Anomalia de Transporte")
             msg_box.setText(mitigation_html)
             msg_box.exec()
 
     def cancel_job(self, job_id: str) -> None:
-        if job_id in self.active_runnables:
-            self.active_runnables[job_id].cancel()
-            self._terminal_jobs.add(job_id)
-            row = self.get_row_by_id(job_id)
-            if row >= 0:
-                item = self.table.item(row, 2)
-                if item is not None:
-                    item.setText("A Cancelar...")
-                    item.setForeground(QColor("#ff9800"))
+        with self._jobs_lock:
+            record = self._jobs.get(job_id)
+            if record and record.runnable:
+                record.runnable.cancel()
+                record.is_terminal = True
+        if (row := self.get_row_by_id(job_id)) >= 0:
+            if i := self.table.item(row, 2):
+                i.setText("A Cancelar...")
+                i.setForeground(QColor("#ff9800"))
 
     def _cleanup_job(self, job_id: str, status_text: str, color: QColor) -> None:
         row = self.get_row_by_id(job_id)
         if row >= 0:
-            item = self.table.item(row, 2)
-            if item is not None:
-                item.setText(status_text)
-                item.setForeground(color)
+            if i := self.table.item(row, 2):
+                i.setText(status_text)
+                i.setForeground(color)
             
-            config = self.job_configs.get(job_id)
-            state = self.job_states.get(job_id)
-            if config and state and state.custom_filename:
-                title_item = self.table.item(row, 0)
-                if title_item is not None:
-                    title_item.setText(f"{state.custom_filename}.{config.format_container}")
-
-            if "Concluído" in status_text: 
-                widget = self.table.cellWidget(row, 3)
-                if isinstance(widget, QProgressBar):
-                    widget.setValue(100)
+            if "Concluído" in status_text:
+                if isinstance(w := self.table.cellWidget(row, 3), QProgressBar): w.setValue(100)
+                btn = QPushButton("Abrir Pasta")
+                btn.clicked.connect(self.open_output_folder)
+            else:
+                if isinstance(w := self.table.cellWidget(row, 3), QProgressBar): w.setValue(0)
+                btn = QPushButton("Repetir")
+                btn.setObjectName("PrimaryAction")
+                btn.clicked.connect(lambda _, jid=job_id: self.retry_job(jid))
                 
-                btn_open = QPushButton("Abrir Pasta")
-                btn_open.clicked.connect(self.open_output_folder)
-                
-                layout = QHBoxLayout()
-                layout.setContentsMargins(0, 0, 0, 0)
-                layout.addWidget(btn_open)
-                container = QWidget()
-                container.setLayout(layout)
-                self.table.setCellWidget(row, 4, container)
-                
-            elif "Cancelado" in status_text or "Erro" in status_text:
-                widget = self.table.cellWidget(row, 3)
-                if isinstance(widget, QProgressBar):
-                    widget.setValue(0)
-                
-                btn_retry = QPushButton("Repetir") 
-                btn_retry.setMinimumWidth(120)
-                btn_retry.setObjectName("PrimaryAction")
-                btn_retry.clicked.connect(lambda _, jid=job_id: self.retry_job(jid))
-                
-                layout = QHBoxLayout()
-                layout.setContentsMargins(0, 0, 0, 0)
-                layout.addWidget(btn_retry)
-                container = QWidget()
-                container.setLayout(layout)
-                self.table.setCellWidget(row, 4, container)
-                
-        def _safe_remove() -> None:
-            if job_id in self.active_runnables: 
-                del self.active_runnables[job_id]
-                
-        QTimer.singleShot(2500, _safe_remove)
+            container = QWidget()
+            layout = QHBoxLayout(container)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.addWidget(btn)
+            self.table.setCellWidget(row, 4, container)
+            
+        QTimer.singleShot(2500, lambda: self._jobs.get(job_id) and setattr(self._jobs[job_id], 'runnable', None))
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._save_settings()
+        
+        with self._jobs_lock:
+            for record in self._jobs.values():
+                if record.runnable: record.runnable.cancel()
+                
+        if not self.thread_pool.waitForDone(5000):
+            logging.warning("[UI] Timeout no encerramento das threads.")
+            
+        for f in self._temp_files:
+            try: f.unlink(missing_ok=True)
+            except: pass
+            
         root_logger = logging.getLogger()
         if self.qt_log_handler in root_logger.handlers:
             root_logger.removeHandler(self.qt_log_handler)
             self.qt_log_handler.close()
-        
-        self.thread_pool.clear()
+            
         event.accept()
 
 def handle_exception(exc_type: type[BaseException], exc_value: BaseException, exc_traceback: Optional[types.TracebackType]) -> None:
@@ -2469,10 +2139,8 @@ def handle_exception(exc_type: type[BaseException], exc_value: BaseException, ex
 def main() -> None:
     sys.excepthook = handle_exception
     logging.basicConfig(level=logging.INFO)
-    
     app = QApplication(sys.argv)
     app.setStyle("Fusion") 
-    
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
