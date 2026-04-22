@@ -467,7 +467,6 @@ class FFmpegCommandBuilder:
         if ext == 'flac': 
             self._cmd.extend(['-c:a', 'flac'])
             if bit_depth not in ("auto", "16"):
-                # Mapeamento do alinhamento de memória (24-bit no FFmpeg exige buffer s32)
                 fmt = 's32' if bit_depth in ("24", "32") else f's{bit_depth}'
                 self._cmd.extend(['-sample_fmt', fmt])
         elif ext == 'wav': 
@@ -483,7 +482,6 @@ class FFmpegCommandBuilder:
         
         if self.config.audio_sample_rate > 0: aresample_opts.append(f"osr={self.config.audio_sample_rate}")
         if self.config.format_container in ['flac', 'wav'] and bit_depth != 'auto':
-            # FFmpeg AVSampleFormat mapeia 24-bit físico para buffer lógico 's32'
             osf_fmt = 's32' if bit_depth in ("24", "32") else 's16'
             aresample_opts.extend([f"osf={osf_fmt}", "dither_method=triangular"])
         if aresample_opts: filters.append(f"aresample={':'.join(aresample_opts)}")
