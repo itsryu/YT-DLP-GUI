@@ -462,12 +462,16 @@ class FFmpegCommandBuilder:
 
     def _apply_audio_codecs(self) -> None:
         ext = self.config.format_container
+        bit_depth = str(self.config.audio_bit_depth)
+        
         if ext == 'flac': 
             self._cmd.extend(['-c:a', 'flac'])
-            if str(self.config.audio_bit_depth) not in ("auto", "16"):
-                self._cmd.extend(['-sample_fmt', f's{self.config.audio_bit_depth}'])
+            if bit_depth not in ("auto", "16"):
+                # Mapeamento do alinhamento de memória (24-bit no FFmpeg exige buffer s32)
+                fmt = 's32' if bit_depth in ("24", "32") else f's{bit_depth}'
+                self._cmd.extend(['-sample_fmt', fmt])
         elif ext == 'wav': 
-            codec = self._PCM_MAP.get(str(self.config.audio_bit_depth), 'pcm_s16le')
+            codec = self._PCM_MAP.get(bit_depth, 'pcm_s16le')
             self._cmd.extend(['-c:a', codec]) 
         elif ext in ['mp3', 'm4a', 'aac']:
             self._cmd.extend(['-c:a', 'aac' if ext in ['m4a', 'aac'] else 'libmp3lame'])
@@ -475,9 +479,13 @@ class FFmpegCommandBuilder:
 
     def _apply_audio_filters(self) -> None:
         filters, aresample_opts = [], []
+        bit_depth = str(self.config.audio_bit_depth)
+        
         if self.config.audio_sample_rate > 0: aresample_opts.append(f"osr={self.config.audio_sample_rate}")
-        if self.config.format_container in ['flac', 'wav'] and self.config.audio_bit_depth != 'auto':
-            aresample_opts.extend([f"osf=s{self.config.audio_bit_depth}", "dither_method=triangular"])
+        if self.config.format_container in ['flac', 'wav'] and bit_depth != 'auto':
+            # FFmpeg AVSampleFormat mapeia 24-bit físico para buffer lógico 's32'
+            osf_fmt = 's32' if bit_depth in ("24", "32") else 's16'
+            aresample_opts.extend([f"osf={osf_fmt}", "dither_method=triangular"])
         if aresample_opts: filters.append(f"aresample={':'.join(aresample_opts)}")
         if self.config.normalize_audio: filters.append("loudnorm=I=-14:TP=-1.5:LRA=11")
         if filters: self._cmd.extend(['-af', ','.join(filters)])
