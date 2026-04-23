@@ -235,19 +235,22 @@ class CircuitBreaker:
         return result
 
 class SessionStateManager:
+    _cookie_lock = threading.RLock()
+
     @staticmethod
     def create_ephemeral_cookie_jar() -> Optional[str]:
         central_cookie = Path("cookies.txt")
-        if not central_cookie.exists(): return None
-        try:
-            fd, temp_path = tempfile.mkstemp(suffix=".txt", prefix="sndstream_session_")
-            os.close(fd)
-            with open(central_cookie, 'rb') as src, open(temp_path, 'wb') as dst:
-                shutil.copyfileobj(src, dst)
-            return temp_path
-        except Exception as e:
-            logging.getLogger(__name__).error(f"[I/O] Falha na alocação de sandbox: {e}")
-            return None
+        with SessionStateManager._cookie_lock:
+            if not central_cookie.exists(): return None
+            try:
+                fd, temp_path = tempfile.mkstemp(suffix=".txt", prefix="sndstream_session_")
+                os.close(fd)
+                with open(central_cookie, 'rb') as src, open(temp_path, 'wb') as dst:
+                    shutil.copyfileobj(src, dst)
+                return temp_path
+            except Exception as e:
+                logging.getLogger(__name__).error(f"[I/O] Falha na alocação de sandbox de cookies: {e}")
+                return None
 
     @staticmethod
     def cleanup_ephemeral_cookie_jar(path: Optional[str]) -> None:
@@ -770,12 +773,28 @@ class DownloadWorker(QRunnable):
         return opts
 
     def _execute_download(self, opts: Dict[str, Any], temp_dir: Path) -> Optional[Path]:
-        def _dl() -> Dict[str, Any]:
+        def _dl(current_opts: Dict[str, Any]) -> Dict[str, Any]:
             with YtDlpAdapter._network_semaphore:
-                with yt_dlp.YoutubeDL(opts) as ydl:
+                with yt_dlp.YoutubeDL(current_opts) as ydl:
                     return cast(Dict[str, Any], ydl.extract_info(self.config.url, download=True))
         
-        info = YtDlpAdapter._circuit_breaker.execute(_dl)
+        try:
+            info = YtDlpAdapter._circuit_breaker.execute(lambda: _dl(opts))
+        except DownloadError as e:
+            err_msg = str(e).lower()
+            if not self.config.use_browser_cookies and any(kw in err_msg for kw in ["sign in", "members only", "private", "age"]):
+                self._logger.warning("Restrição de acesso detectada. Iniciando mitigação automática via matriz de cookies local.")
+                ephemeral_cookie = SessionStateManager.create_ephemeral_cookie_jar()
+                if ephemeral_cookie:
+                    self.state.ephemeral_cookie = ephemeral_cookie
+                    fallback_opts = opts.copy()
+                    fallback_opts['cookiefile'] = ephemeral_cookie
+                    info = YtDlpAdapter._circuit_breaker.execute(lambda: _dl(fallback_opts))
+                else:
+                    raise ExtractionError("A restrição requer autenticação, contudo a matriz de cookies (cookies.txt) encontra-se inacessível ou ausente.") from e
+            else:
+                raise ExtractionError(str(e)) from e
+                
         self._check_abort()
         
         filepath = info.get('filepath') or info.get('_filename')

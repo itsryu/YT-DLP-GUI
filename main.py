@@ -143,12 +143,26 @@ class CookieImportWorker(QRunnable):
     @pyqtSlot()
     def run(self) -> None:
         try:
-            with open(self.source_path, "r", encoding="utf-8", errors="ignore") as f:
-                if "# Netscape HTTP Cookie File" not in f.read(120):
-                    self.signals.error.emit("A assinatura léxica do ficheiro não corresponde à RFC 'Netscape HTTP Cookie File'. A importação foi abortada.")
-                    return
             target_path = Path.cwd() / "cookies.txt"
-            shutil.copy2(self.source_path, target_path)
+            
+            if self.source_path.absolute() == target_path.absolute():
+                self.signals.success.emit(str(target_path.absolute()))
+                return
+
+            try:
+                with open(self.source_path, "r", encoding="utf-8", errors="ignore") as f:
+                    if "# Netscape HTTP Cookie File" not in f.read(120):
+                        self.signals.error.emit("A assinatura léxica do ficheiro não corresponde à RFC 'Netscape HTTP Cookie File'. A importação foi abortada.")
+                        return
+            except PermissionError as e:
+                self.signals.error.emit(f"Falha de I/O [WinError 32]: O ficheiro matriz encontra-se bloqueado por outro processo em execução (ex: Google Chrome, Edge). Encerre-o e tente novamente. Detalhe: {e}")
+                return
+            
+            with proc.SessionStateManager._cookie_lock:
+                tmp_target = target_path.with_suffix('.tmp_import')
+                shutil.copy2(self.source_path, tmp_target)
+                os.replace(tmp_target, target_path)
+
             self.signals.success.emit(str(target_path.absolute()))
         except Exception as e:
             self.signals.error.emit(f"Falha de I/O não tratada: {str(e)}")
@@ -1571,14 +1585,15 @@ class MainWindow(QMainWindow):
 
     def _check_cookie_format(self) -> bool:
         cookie_path = Path("cookies.txt")
-        if not cookie_path.exists(): return True
-        try:
-            with open(cookie_path, "r", encoding="utf-8", errors="ignore") as f:
-                if "# Netscape HTTP Cookie File" not in f.read(100):
-                    QMessageBox.critical(self, "Erro de Integridade Léxica", "O ficheiro 'cookies.txt' não obedece ao padrão Netscape HTTP.")
-                    return False
-        except Exception: pass
-        return True
+        with proc.SessionStateManager._cookie_lock:
+            if not cookie_path.exists(): return True
+            try:
+                with open(cookie_path, "r", encoding="utf-8", errors="ignore") as f:
+                    if "# Netscape HTTP Cookie File" not in f.read(100):
+                        QMessageBox.critical(self, "Erro de Integridade Léxica", "O ficheiro 'cookies.txt' não obedece ao padrão Netscape HTTP.")
+                        return False
+            except Exception: pass
+            return True
 
     @pyqtSlot(str)
     def _on_url_text_changed(self, text: str) -> None:
@@ -1763,7 +1778,6 @@ class MainWindow(QMainWindow):
             record = self._jobs.pop(job_id, None)
             if record:
                 if record.runnable:
-                    record.runnable.signals.disconnect()
                     record.runnable.cancel()
                 record.is_terminal = True
             
@@ -2051,7 +2065,6 @@ class MainWindow(QMainWindow):
         with self._jobs_lock:
             record = self._jobs.get(job_id)
             if record and record.runnable:
-                record.runnable.signals.disconnect()
                 record.runnable.cancel()
                 record.is_terminal = True
         if (row := self.get_row_by_id(job_id)) >= 0:
@@ -2090,7 +2103,6 @@ class MainWindow(QMainWindow):
         with self._jobs_lock:
             for record in self._jobs.values():
                 if record.runnable:
-                    record.runnable.signals.disconnect()
                     record.runnable.cancel()
                 
         if not self.thread_pool.waitForDone(3000):
