@@ -414,9 +414,17 @@ class YtDlpAdapter(MediaExtractorPort):
                 children=[self._map_to_entity(entry) for entry in info.get('entries', []) if entry]
             )
         
+        thumbnails = info.get('thumbnails', [])
+        best_thumb_url = info.get('thumbnail')
+        
+        if thumbnails:
+            valid_thumbs = [t for t in thumbnails if t.get('width') and t.get('height') and 'url' in t]
+            if valid_thumbs:
+                best_thumb_url = max(valid_thumbs, key=lambda t: t['width'] * t['height'])['url']
+
         return NormalizedMediaEntity(
             original_id=canonical_id, title=info.get('title', 'Unknown'), artist=info.get('artist', info.get('uploader', 'Unknown')),
-            album=info.get('album', ''), duration=float(info.get('duration', 0.0) or 0.0), thumbnail_url=info.get('thumbnail'),
+            album=info.get('album', ''), duration=float(info.get('duration', 0.0) or 0.0), thumbnail_url=best_thumb_url,
             is_playlist=False, upload_date=info.get('upload_date'), description=info.get('description'),
             width=info.get('width'), height=info.get('height'), fps=info.get('fps'), channel=info.get('channel') or info.get('uploader'),
             filesize=info.get('filesize_approx') or info.get('filesize') or 0
@@ -505,10 +513,14 @@ class FFmpegCommandBuilder:
 
     def _apply_mapping_and_output(self) -> None:
         if self.cover_path:
-            self._cmd.extend(['-map', '0:a:0', '-map', '1:v:0', '-c:v', 'mjpeg', '-disposition:v', 'attached_pic'])
+            self._cmd.extend(['-map', '0:a:0', '-map', '1:v:0'])
+            self._cmd.extend(['-vf', r"crop='min(in_w\,in_h)':'min(in_w\,in_h)'"])
+            
+            self._cmd.extend(['-c:v', 'mjpeg', '-disposition:v', 'attached_pic'])
             if self.config.format_container == 'mp3':
                 self._cmd.extend(['-id3v2_version', '3', '-metadata:s:v', 'title=Album cover', '-metadata:s:v', 'comment=Cover (front)'])
-        else: self._cmd.extend(['-map', '0:a:0'])
+        else: 
+            self._cmd.extend(['-map', '0:a:0'])
         self._cmd.append(str(self.dest_path))
 
 class FFmpegAdapter(AudioProcessorPort):
